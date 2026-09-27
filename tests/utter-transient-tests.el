@@ -139,6 +139,25 @@
       (utter-transient--refresh-menu 'item 0 10)
       (should (= refreshed 1)))))
 
+;; The real private function, on whichever transient is loaded.
+(ert-deftest utter-transient-test-refresh-redraws-open-menu ()
+  (let ((utter-ui-test--state '(:status idle)))
+    (utter-transient-test-with-menu
+      (should-not (string-search "Playback" (utter-transient-test--menu-text)))
+      (setq utter-ui-test--state utter-ui-test--playing-state)
+      (with-temp-buffer                 ; an unrelated current buffer
+        (run-hook-with-args 'utter-progress-functions 'item 0 10))
+      (let ((text (utter-transient-test--menu-text)))
+        (should (string-prefix-p "Playing reading-aloud.org" text))
+        (should (string-search "Playback" text))
+        (should (assoc "SPC" (utter-transient-test--suffixes)))))))
+
+(ert-deftest utter-transient-test-evil-environment-attached ()
+  (if (slot-exists-p 'transient-prefix 'environment)
+      (should (eq (oref (get 'utter-menu 'transient--prefix) environment)
+                  #'utter--transient-fix-evil-visual))
+    (should-not (slot-exists-p 'transient-prefix 'environment))))
+
 ;;;; Heading
 
 (defun utter-transient-test--heading (state)
