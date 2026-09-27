@@ -322,18 +322,22 @@ Return a plist of request keys plus :cache-only."
             :cache (get :cache t)
             :cache-only (plist-get params :cache-only)))))
 
+(defun utter--params-args (params)
+  "Return the `utter-request' keyword arguments in resolved PARAMS."
+  (list :backend (plist-get params :backend)
+        :model (plist-get params :model)
+        :voice (plist-get params :voice)
+        :speed (plist-get params :speed)
+        :format (plist-get params :format)
+        :language (plist-get params :language)
+        :instructions (plist-get params :instructions)
+        :cache (plist-get params :cache)))
+
 (defun utter--request-args (item seg)
   "Return the `utter-request' keyword arguments for SEG of ITEM."
   (let* ((p (utter-item-params item))
          (backend (plist-get p :backend))
-         (args (list :backend backend
-                     :model (plist-get p :model)
-                     :voice (plist-get p :voice)
-                     :speed (plist-get p :speed)
-                     :format (plist-get p :format)
-                     :language (plist-get p :language)
-                     :instructions (plist-get p :instructions)
-                     :cache (plist-get p :cache))))
+         (args (utter--params-args p)))
     (if (memq 'stitching (utter-backend-capabilities backend))
         (append args (list :context (funcall utter--segment-context-function
                                              item (utter--segment-index seg))))
