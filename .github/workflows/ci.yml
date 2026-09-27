@@ -18,8 +18,8 @@ jobs:
       - uses: purcell/setup-emacs@master
         with:
           version: ${{ matrix.emacs-version }}
-      - name: Install package-lint
-        run: make lint-deps
+      - name: Install dependencies (transient from GNU ELPA, package-lint)
+        run: make deps
       - name: Byte compile
         run: make compile
       - name: Lint
@@ -36,5 +36,7 @@ jobs:
       - uses: purcell/setup-emacs@master
         with:
           version: '30.1'
+      - name: Install dependencies (transient from GNU ELPA)
+        run: make deps
       - name: Run tests
         run: make test

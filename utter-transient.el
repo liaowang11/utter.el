@@ -848,6 +848,9 @@ rate is shown once, on the rate-up key."
   "Read text aloud: settings, input, output and playback control."
   :refresh-suffixes t
   :incompatible '(("m" "y") ("S" "f" "c"))
+  ;; Needs transient 0.7.8 (Package-Requires); `make deps' installs it from
+  ;; GNU ELPA where Emacs bundles an older copy.
+  :environment #'utter--transient-fix-evil-visual
   [:description utter--menu-heading
    ["Backend"
     (utter--infix-provider)
@@ -888,14 +891,6 @@ rate is shown once, on the rate-up key."
   (interactive)
   (utter--sanitize-settings)
   (transient-setup 'utter-menu))
-
-;; The `environment' slot appeared in transient 0.7.8, but Emacs 30.1
-;; bundles 0.7.2.2, whose `transient-define-prefix' rejects the keyword
-;; (invalid-slot-name) when `-Q' loads the bundled copy.  So attach the
-;; evil fix only where the slot exists.
-(when (slot-exists-p 'transient-prefix 'environment)
-  (oset (get 'utter-menu 'transient--prefix) environment
-        #'utter--transient-fix-evil-visual))
 
 (provide 'utter-transient)
 ;;; utter-transient.el ends here

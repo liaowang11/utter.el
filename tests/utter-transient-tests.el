@@ -274,10 +274,9 @@ menu opens; VALUE is the menu's initial switches."
         (should (eq applied #'transient--refresh-transient))))))
 
 (ert-deftest utter-transient-test-evil-environment-attached ()
-  (if (slot-exists-p 'transient-prefix 'environment)
-      (should (eq (oref (get 'utter-menu 'transient--prefix) environment)
-                  #'utter--transient-fix-evil-visual))
-    (should-not (slot-exists-p 'transient-prefix 'environment))))
+  "The evil visual fix is the prefix's environment (transient >= 0.7.8)."
+  (should (eq (oref (get 'utter-menu 'transient--prefix) environment)
+              #'utter--transient-fix-evil-visual)))
 
 ;;;; Live labels: the Input heading and RET
 

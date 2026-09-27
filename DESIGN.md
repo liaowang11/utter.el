@@ -369,11 +369,11 @@ Input/Output gptel-style, and moved the rate to the rate-up label only):
   command) 'utter-menu))`, and skips while the minibuffer is active or a
   menu suffix runs (`transient-current-command` non-nil; post-command
   redraws then).  `transient--refresh` does not exist in transient 0.13.7.
-- Evil: gptel's visual-state `:environment` fix, guarded by `fboundp`.  It
-  is attached with `oset` only when the `environment` slot exists: the
-  transient bundled with Emacs 30.1 (0.7.2.2, loaded by `emacs -Q` in CI)
-  rejects `:environment` in `transient-define-prefix` with
-  `invalid-slot-name`.
+- Evil: gptel's visual-state `:environment` fix, guarded by `fboundp` and
+  written inline in `transient-define-prefix`.  That slot needs transient
+  0.7.8 (the declared minimum); Emacs 30.x bundles 0.7.2.2, so `make deps`
+  installs transient from GNU ELPA into `.deps/elpa` and every batch target
+  loads it from there when present (CI does this on every job).
 - `utter-mode`: buffer-local minor mode, no lighter, sets
   `header-line-format` to `(:eval (utter--header-line))` and restores the
   old one on exit. `utter-mode-map`: `SPC` pause, `n`/`p` utterance,

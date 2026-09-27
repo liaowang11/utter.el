@@ -3,3 +3,4 @@
 .agent-shell/
 /.eask
 /tmp/
+/.deps/

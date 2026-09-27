@@ -163,3 +163,5 @@ Backend                                    <Read from region          >Output to
 Not verified: rendering under vertico/marginalia (group function and
 annotations are tested as functions only), evil visual state in a real
 session, and the real `say`/network voice fetch (stubbed).
+
+Update (main session, same day): `make deps` now installs transient from GNU ELPA into `.deps/elpa` and CI runs it on every job, so item L is done: `:environment` is inline in the prefix and the `slot-exists-p` guard is gone.
