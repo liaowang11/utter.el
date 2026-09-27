@@ -20,19 +20,23 @@
 
 ;;;; Fake engine
 
-(unless (fboundp 'make-utter-item)
-  (cl-defstruct utter-item
-    id text status params source-buffer source-name markers tick created
-    segments (position 0)))
+;; Quoted and `eval'ed: eager macroexpansion of a bare `cl-defstruct'
+;; would register the class before the guard is tested.
+(unless (cl-find-class 'utter-item)
+  (eval '(cl-defstruct utter-item
+           id text status params source-buffer source-name markers tick
+           created segments (position 0))
+        t))
 
-(unless (fboundp 'utter--make-backend)
-  (cl-defstruct (utter-backend (:constructor utter--make-backend)
-                               (:copier utter--copy-backend))
-    name host protocol endpoint url header key
-    models voices formats max-chars
-    (max-chars-unit 'chars) (response-kind 'bytes) response-path
-    capabilities request-params curl-args body-transform
-    (coding-system 'binary)))
+(unless (cl-find-class 'utter-backend)
+  (eval '(cl-defstruct (utter-backend (:constructor utter--make-backend)
+                                      (:copier utter--copy-backend))
+           name host protocol endpoint url header key
+           models voices formats max-chars
+           (max-chars-unit 'chars) (response-kind 'bytes) response-path
+           capabilities request-params curl-args body-transform
+           (coding-system 'binary))
+        t))
 
 ;; No-ops once the real defcustoms and defvars exist.
 (defvar utter-backend nil)
