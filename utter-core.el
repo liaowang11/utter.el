@@ -838,8 +838,13 @@ STATUS is one of pending, running, done, error and aborted."
          (model (if (stringp model) (intern model) model))
          (params (plist-put (copy-sequence params) :model model)))
     (unless (plist-get params :voice)
-      (setq params (plist-put params :voice
-                              (utter--voice-name (car (utter--static-voices backend model))))))
+      ;; Only declared lists give a default voice; a fetched list has no
+      ;; meaningful first entry, so backends handle a nil voice themselves.
+      (let ((mv (plist-get (utter--model-plist backend model) :voices))
+            (bv (utter-backend-voices backend)))
+        (setq params (plist-put params :voice
+                                (utter--voice-name
+                                 (car (cond ((consp mv) mv) ((consp bv) bv))))))))
     (unless (plist-get params :format)
       (setq params (plist-put params :format (car (utter--formats backend model)))))
     (let ((fmt (plist-get params :format)))
