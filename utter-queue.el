@@ -33,7 +33,7 @@
 (require 'format-spec)
 (require 'utter-text)
 ;; Soft while utter-core.el is written in parallel.
-(require 'utter-core nil t)
+(require 'utter-core)
 
 ;;;; Core symbols (defined in utter-core.el)
 

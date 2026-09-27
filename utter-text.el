@@ -27,7 +27,7 @@
 (require 'subr-x)
 ;; For the `utter' customization group.  Soft while utter-core.el is
 ;; written in parallel.
-(require 'utter-core nil t)
+(require 'utter-core)
 
 ;;;; Preprocessing
 

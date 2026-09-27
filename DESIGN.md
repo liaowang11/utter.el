@@ -209,7 +209,12 @@ utter-player-mpv      ; mpv --no-video --speed=RATE FILE
 (defcustom utter-player 'auto)   ; first installed player that plays the segment's format
 ```
 
-Pause is SIGSTOP/SIGCONT (verified on afplay and ffplay). Prefetch
+Pause is SIGSTOP/SIGCONT for afplay (verified: it keeps its place). ffplay
+stops under SIGSTOP but skips the paused stretch on SIGCONT, so
+`utter-player-ffplay` resumes by restarting at the paused offset with `-ss`
+(`utter-player-restart`; a player `command` may take an optional third
+argument OFFSET). mpv is not installed here and its SIGCONT path is
+unverified. Prefetch
 `utter-prefetch-depth` (2) segments ahead across item boundaries, at most
 `utter-max-concurrent-requests` (2) curl processes. On 429/5xx retry once
 with backoff, then mark the segment `error`, `message` it, continue.
@@ -225,6 +230,7 @@ utter-queue-finished-hook     ; () queue went idle
 utter-error-functions         ; (ITEM ERROR-STRING) default: message
 utter-notify-function         ; nil | (lambda (title body))
 utter--segment-context-function ; private: (ITEM INDEX) -> (:previous :next) for stitching backends
+utter--state-change-hook       ; private: () on every state change incl. pause/resume/rate; UI redraws from it, no timer
 ```
 
 Lighter: `utter-lighter` default `" ♪%i/%n"` where `%i/%n` counts
@@ -295,7 +301,8 @@ other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
  ["Input <"  r Region (default)  b Buffer from point  o Org subtree  e EWW / Info page  y Kill-ring  m Minibuffer  t String from Lisp]
  ["Output >" s Speakers, append (default)  S Speakers, interrupt  f Save to file  c Cache only]
  ["Playback" :if utter-active-p            ; every suffix :transient t
-             SPC Pause/resume  n Next utterance  p Previous utterance  +/- Rate  x Clear pending  q Stop all  Q Queue buffer]
+             SPC Pause/resume  n Next utterance  p Previous utterance  +/_ Rate  x Clear pending  q Stop all  Q Queue buffer]
+             ; rate-down is `_' in the menu because transient cannot bind `-' next to the `-m' `-v' ... infixes; utter-mode-map keeps `-'
  [RET Speak   I Inspect (:if utter-expert-commands)]
 ```
 
@@ -343,8 +350,10 @@ other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
 
 ## Repository conventions
 
-- Emacs 30.1+, `lexical-binding: t`, SPDX `GPL-3.0-or-later`, header shape
-  as in `utter.el`.
+- Emacs 30.1+ (bundled transient 0.7.2.2 has `:refresh-suffixes` and
+  `transient--refresh-transient`; the `:environment` slot needs transient
+  0.7.8, hence `Package-Requires` `(transient "0.7.8")`), `lexical-binding: t`,
+  SPDX `GPL-3.0-or-later`, header shape as in `utter.el`.
 - `make compile` (byte-compile with `load-prefer-newer`), `make test`
   (ERT batch), `make lint` (checkdoc + package-lint when available),
   `make check` = compile + test.
@@ -356,3 +365,11 @@ other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
   branches. Never commit to `main` from a worktree.
 - Each agent writes `reports/<area>.md` (what was built, how it was
   verified, HANDOFF list, unverified items) before finishing.
+
+## Status (2026-09-27)
+
+Merged from four parallel worktrees (env, core, ui, engine): 200 ERT tests
+pass with `make check` on Emacs 31.1.50 and 30.2 on macOS; CI runs Linux
+30.1, Linux snapshot and macOS. End-to-end in batch with the `say` backend:
+`utter-speak-string` → aiff in the cache → afplay → idle in 4.3 s.
+Per-module reports with HANDOFF and unverified lists are in `reports/`.
