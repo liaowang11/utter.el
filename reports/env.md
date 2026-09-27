@@ -20,7 +20,7 @@
   `continue-on-error` only for snapshot. `macos` job: macos-latest,
   Emacs 30.1, `make test`.
 - `tests/support/utter-test-server.el`: local HTTP stub (API below).
-- `tests/utter-test-server-tests.el`: 8 self-tests against real curl.
+- `tests/utter-test-server-tests.el`: 9 self-tests against real curl.
 - `README.md` (176 lines), `.gitignore` (`*.elc`, `/reports/*.tmp`,
   `.agent-shell/`, `/.eask`, `/tmp/`).
 - `.dir-locals.el` did not exist on main; none was created.
@@ -28,7 +28,8 @@
 ## Verification
 
 - Emacs 31.1.50 (local) and Emacs 30.2 (`nixpkgs#emacs30-nox`):
-  `make compile lint test` pass; 8/8 server tests in ~0.5 s.
+  `make compile lint test` pass; 9/9 server tests in ~0.6 s. Emacs 30.1 itself was
+  not run locally.
 - Zero-test path: `make test` before the server tests existed printed
   "Ran 0 tests" and exited 0.
 - `make lint` negative checks: a file with a bad docstring makes checkdoc
@@ -96,7 +97,10 @@ Pitfalls for other agents:
 2. **HTTP proxies.** curl honors `http_proxy` for 127.0.0.1 (Bill's
    machine sets proxies). `utter-test-server-with` binds
    `no_proxy`/`NO_PROXY=127.0.0.1,localhost` in `process-environment`,
-   so curl started inside the macro bypasses the proxy. Tests that call
+   so curl started inside the macro bypasses the proxy. Verified both
+   ways: `utter-test-server-with-bypasses-proxy` passes with a dead
+   `http_proxy=127.0.0.1:9` set, and the same curl without the binding
+   exits 7. Tests that call
    `utter-test-server-start` directly must do the same, or CORE's curl
    runner must pass `--noproxy` for localhost. A proxied request shows up
    as a timeout or a proxy error page, not as a route miss.
@@ -122,6 +126,7 @@ Pitfalls for other agents:
 
 ## Unverified
 
+- Emacs 30.1 exactly (tested 30.2 and 31.1.50).
 - CI has never run. `purcell/setup-emacs@master` with 30.1 on
   `macos-latest` (arm64) and with `snapshot` on ubuntu are unverified,
   as is `make lint-deps` reaching MELPA from the runner.

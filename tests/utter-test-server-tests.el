@@ -16,12 +16,16 @@
 (require 'utter-test-server)
 
 (defun utter-test-server-tests--curl (&rest args)
+  "Run curl with ARGS, bypassing any proxy, and wait for it.
+Return a plist (:exit CODE :stdout STRING)."
+  (apply #'utter-test-server-tests--curl-raw "--noproxy" "*" args))
+
+(defun utter-test-server-tests--curl-raw (&rest args)
   "Run curl with ARGS asynchronously and wait for it.
 Return a plist (:exit CODE :stdout STRING)."
   (let* ((buf (generate-new-buffer " *curl*"))
          (proc (make-process :name "curl" :buffer buf
-                             :command (append '("curl" "--silent" "--show-error"
-                                                "--noproxy" "*")
+                             :command (append '("curl" "--silent" "--show-error")
                                               args)
                              :connection-type 'pipe
                              :coding 'binary
@@ -50,6 +54,17 @@ Return a plist (:exit CODE :stdout STRING)."
         (should (equal (plist-get req :method) "GET"))
         (should (equal (plist-get req :path) "/hello"))
         (should (equal (plist-get req :body) ""))))))
+
+(ert-deftest utter-test-server-with-bypasses-proxy ()
+  ;; A dead proxy in the environment: without the macro's no_proxy
+  ;; binding curl would fail to connect.
+  (let ((process-environment
+         (append '("http_proxy=http://127.0.0.1:9" "HTTP_PROXY=http://127.0.0.1:9")
+                 process-environment)))
+    (utter-test-server-with (port '(("^/p$" . (:body "direct"))))
+      (let ((r (utter-test-server-tests--curl-raw
+                (format "http://127.0.0.1:%d/p" port))))
+        (should (equal r '(:exit 0 :stdout "direct")))))))
 
 (ert-deftest utter-test-server-post-json-and-headers ()
   (utter-test-server-with
