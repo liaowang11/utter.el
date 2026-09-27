@@ -611,17 +611,14 @@ and redraw the menu."
 
 (defun utter-transient--live-args ()
   "Return the menu's switches as they are now, also while it is drawn.
-`transient-args' only sees the exported value inside a suffix; while
-the menu is drawn this simulates the export, as gptel does."
-  (or (and transient-current-command
-           (transient-args transient-current-command))
-      (and transient--prefix
-           (eq (oref transient--prefix command) 'utter-menu)
-           ;; HACK: transient internals, for live labels (see
-           ;; `gptel--describe-suffix-send').
-           (let* ((transient-current-command (oref transient--prefix command))
-                  (transient-current-suffixes transient--suffixes))
-             (transient-args transient-current-command)))))
+Inside a suffix this is `transient-args'; while the menu is drawn
+it is `transient-get-value', the API for descriptions (transient
+0.8.8 or later)."
+  (cond (transient-current-command
+         (transient-args transient-current-command))
+        ((and transient--prefix
+              (eq (oref transient--prefix command) 'utter-menu))
+         (transient-get-value))))
 
 ;;;; Input and output
 
@@ -848,8 +845,8 @@ rate is shown once, on the rate-up key."
   "Read text aloud: settings, input, output and playback control."
   :refresh-suffixes t
   :incompatible '(("m" "y") ("S" "f" "c"))
-  ;; Needs transient 0.7.8 (Package-Requires); `make deps' installs it from
-  ;; GNU ELPA where Emacs bundles an older copy.
+  ;; Needs transient 0.7.8 or later (Package-Requires asks for 0.8.8);
+  ;; `make deps' installs it from GNU ELPA where Emacs bundles an older copy.
   :environment #'utter--transient-fix-evil-visual
   [:description utter--menu-heading
    ["Backend"

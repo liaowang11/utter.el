@@ -5,7 +5,7 @@
 
 ;; Author: Bill
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "30.1") (transient "0.7.8"))
+;; Package-Requires: ((emacs "30.1") (transient "0.8.8"))
 ;; Keywords: multimedia, convenience
 ;; URL: https://github.com/liaowang11/utter.el
 

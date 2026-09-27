@@ -328,9 +328,9 @@ Input/Output gptel-style, and moved the rate to the rate-up label only):
   point, mark, region, switches and kill) and description functions never
   signal.
 - Live switches while drawing: `transient-args` sees only the exported
-  value inside a suffix, so `utter-transient--live-args` binds
-  `transient-current-command` and `transient-current-suffixes` as gptel
-  does.  `transient-get-value` is not used (not documented API in 0.7.8).
+  value inside a suffix, so `utter-transient--live-args` uses
+  `transient-get-value` (the documented API for descriptions, transient
+  0.8.8) while the menu is drawn and `transient-args` inside a suffix.
 - `:refresh-suffixes t`; `:incompatible '(("m" "y") ("S" "f" "c"))`.
   Playback suffixes call the ENGINE commands directly.
 - `utter--suffix-speak (args)` is the single dispatch: input switch → text,
@@ -371,7 +371,8 @@ Input/Output gptel-style, and moved the rate to the rate-up label only):
   redraws then).  `transient--refresh` does not exist in transient 0.13.7.
 - Evil: gptel's visual-state `:environment` fix, guarded by `fboundp` and
   written inline in `transient-define-prefix`.  That slot needs transient
-  0.7.8 (the declared minimum); Emacs 30.x bundles 0.7.2.2, so `make deps`
+  0.7.8 and `transient-get-value` 0.8.8 (the declared minimum); Emacs 30.x
+  bundles 0.7.2.2, so `make deps`
   installs transient from GNU ELPA into `.deps/elpa` and every batch target
   loads it from there when present (CI does this on every job).
 - `utter-mode`: buffer-local minor mode, no lighter, sets
@@ -406,7 +407,8 @@ Input/Output gptel-style, and moved the rate to the rate-up label only):
 
 - Emacs 30.1+ (bundled transient 0.7.2.2 has `:refresh-suffixes` and
   `transient--refresh-transient`; the `:environment` slot needs transient
-  0.7.8, hence `Package-Requires` `(transient "0.7.8")`), `lexical-binding: t`,
+  0.7.8 and `transient-get-value` 0.8.8, hence `Package-Requires`
+  `(transient "0.8.8")`, installed by `make deps`), `lexical-binding: t`,
   SPDX `GPL-3.0-or-later`, header shape as in `utter.el`.
 - `make compile` (byte-compile with `load-prefer-newer`), `make test`
   (ERT batch), `make lint` (checkdoc + package-lint when available),
