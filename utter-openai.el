@@ -109,7 +109,7 @@ See the Commentary for OpenRouter, Kokoro-FastAPI and mlx-audio."
   (if (symbolp value) (symbol-name value) value))
 
 (cl-defmethod utter--normalize-params ((backend utter-openai) params)
-  "Clamp PARAMS' :speed to 0.25-4, then apply the default rules."
+  "Clamp PARAMS' :speed to 0.25-4 for BACKEND, then apply the default rules."
   (let ((speed (plist-get params :speed)))
     (when speed
       (setq params (plist-put params :speed (float (min 4.0 (max 0.25 speed)))))))
