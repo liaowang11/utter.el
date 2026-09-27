@@ -269,7 +269,7 @@
 
 ;;;; Local HTTP stub server
 
-(defvar utter-test-server nil "The running stub server process.")
+(defvar utter-test-server-proc nil "The running stub server process.")
 (defvar utter-test-requests nil "Requests received, newest first.")
 (defvar utter-test-routes nil
   "Alist PATH -> (STATUS CONTENT-TYPE BODY) for the stub server.
@@ -302,10 +302,10 @@ PATH is matched without the query string.")
                   body))
     (process-send-eof proc)))
 
-(defun utter-test-server-start ()
+(defun utter-test-start-server ()
   "Start the stub server if needed; return its base URL host:port."
-  (unless (process-live-p utter-test-server)
-    (setq utter-test-server
+  (unless (process-live-p utter-test-server-proc)
+    (setq utter-test-server-proc
           (make-network-process
            :name "utter-stub" :server t :host "127.0.0.1" :service t
            :family 'ipv4 :coding 'binary :noquery t
@@ -315,7 +315,7 @@ PATH is matched without the query string.")
                        (when-let* ((req (utter-test--parse-request data)))
                          (push req utter-test-requests)
                          (utter-test--respond proc req)))))))
-  (format "127.0.0.1:%d" (process-contact utter-test-server :service)))
+  (format "127.0.0.1:%d" (process-contact utter-test-server-proc :service)))
 
 (defun utter-test-wait (pred &optional timeout)
   "Pump the event loop until PRED returns non-nil or TIMEOUT seconds pass."
@@ -329,7 +329,7 @@ PATH is matched without the query string.")
   (declare (indent 1))
   `(let ((utter-test-routes ,routes)
          (utter-test-requests nil)
-         (host (utter-test-server-start)))
+         (host (utter-test-start-server)))
      (ignore host)
      ,@body))
 
