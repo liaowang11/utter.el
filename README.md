@@ -126,6 +126,40 @@ are passed to curl on stdin, never on the command line.
 | `utter-stop`, `utter-clear` | Stop everything; drop pending utterances (`C-u` also finished ones) |
 | `utter-log` | Show the request log |
 
+### The menu
+
+```
+Playing notes.org (2/5) · OpenAI:gpt-4o-mini-tts/nova
+Backend                          <Read from region          >Output to                 Playback
+ -m Backend:model OpenAI:...     m Minibuffer instead (m)   S Speakers, interrupt (S)   SPC Pause/resume
+ -v Voice (default)              y Kill-ring instead (y)    f Save to file (f)          n Next utterance
+ -s Speed 1.0                                               c Cache only (c)            p Previous utterance
+ -f Format (default)                                                                    + Rate up (1.0x)
+ -l Language auto                                                                       _ Rate down
+ -i Instructions (none)                                                                 x Clear pending
+ -H Highlight spoken text (off)                                                         q Stop all
+ = Scope (global|buffer|oneshot)                                                        Q Queue buffer
+ @ Preset (none)
+
+ RET Speak region (lines 9-10, ~6 s), append as utterance 6
+```
+
+The heading shows what is playing. `<Read from` names the text `RET`
+reads: the region, a source that claims point, or the buffer to point;
+`m` and `y` read the minibuffer or the latest kill instead (`C-u RET`
+with `y` picks an older kill). Appending to the queue is the default;
+`S`, `f` and `c` interrupt, save to a file, or only fill the cache.
+The `RET` line always says what will happen: the source, its lines,
+an estimated speaking time and the destination, for example
+`Save Org subtree (lines 5-30) to file`, or `Nothing to read aloud`.
+Labels refresh while the menu is open. The Playback column appears
+only while something plays. `-i` is greyed out for models that take
+no instructions, `@` when no presets exist; a preset whose settings
+were changed since is struck through. `I` (Inspect, a dry run of the
+request) appears when `utter-expert-commands` or `utter-log-level` is
+set. With `transient-bind-q-to-quit`, transient moves `q` Stop all to
+`Q` and `Q` Queue buffer to `M-q`.
+
 The queue buffer (`Q` in the menu) lists one row per utterance with its
 status, backend and voice, first words, progress and source. There,
 `utter-mode` provides `SPC` pause, `n`/`p` next/previous, `+`/`-` rate,

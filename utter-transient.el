@@ -36,11 +36,13 @@
 (defvar utter-highlight)
 (defvar utter-playback-rate)
 (defvar utter-expert-commands)
-(defvar utter-progress-functions)
-(defvar utter-queue-finished-hook)
+(defvar utter-log-level)
+(defvar utter-input-functions)
+(defvar utter--state-change-hook)
 (defvar utter--set-scope)
 (defvar utter--known-backends)
 (defvar utter--known-presets)
+(defvar utter--preset)
 
 (declare-function utter-state "utter-queue" ())
 (declare-function utter-active-p "utter-queue" ())
@@ -52,15 +54,25 @@
 (declare-function utter--apply-preset "utter" (preset &optional setter))
 (declare-function utter-get-backend "utter-core" (name))
 (declare-function utter--list-voices "utter-core" (backend callback))
-(declare-function utter-request "utter-core" (text &rest keys))
+(declare-function utter--inspect-text "utter" (text))
+(declare-function utter--sanitize-settings "utter" (&optional backend setter skip))
+(declare-function utter--preset-spec "utter" (preset))
+(declare-function utter--preset-var "utter" (key))
+(declare-function utter--input-candidate "utter" ())
+(declare-function utter--blank-p "utter" (beg end))
+(declare-function utter--text-at-point "utter" (&optional arg))
+(declare-function utter--single-segment "utter" (text params))
+(declare-function utter--snapshot-params "utter-queue" (params text))
+(declare-function utter--estimate-seconds "utter-queue" (text speed))
+(declare-function utter--short-name "utter-queue" (text))
+(declare-function utter--static-voices "utter-core" (backend &optional model))
+(declare-function utter--formats "utter-core" (backend &optional model))
+(declare-function utter--capable-p "utter-core" (backend model capability))
+(declare-function utter-backend-max-chars-unit "utter-core" (backend))
 (declare-function utter-backend-name "utter-core" (backend))
 (declare-function utter-backend-models "utter-core" (backend))
-(declare-function utter-backend-voices "utter-core" (backend))
-(declare-function utter-backend-formats "utter-core" (backend))
 (declare-function utter-backend-capabilities "utter-core" (backend))
 (declare-function utter-backend-max-chars "utter-core" (backend))
-(declare-function org-back-to-heading "org" (&optional invisible-ok))
-(declare-function org-end-of-subtree "org" (&optional invisible-ok to-heading))
 (declare-function evil-visual-expand-region "evil-states" (&optional exclude-newline))
 (declare-function evil-visual-contract-region "evil-states" ())
 (defvar evil-visual-region-expanded)
@@ -71,11 +83,15 @@
   "Return the backend object for BACKEND, an object or a registered name."
   (if (stringp backend) (utter-get-backend backend) backend))
 
+(defun utter-transient--source-buffer ()
+  "Return the buffer the menu was opened from, else the current buffer."
+  (if (buffer-live-p transient--original-buffer)
+      transient--original-buffer
+    (current-buffer)))
+
 (defun utter-transient--original (symbol)
   "Return SYMBOL's value in the buffer the menu was opened from."
-  (buffer-local-value symbol (if (buffer-live-p transient--original-buffer)
-                                 transient--original-buffer
-                               (current-buffer))))
+  (buffer-local-value symbol (utter-transient--source-buffer)))
 
 (defun utter-transient--model-symbol (model)
   "Return the name symbol of MODEL, a symbol or (SYMBOL . PLIST)."
@@ -100,42 +116,66 @@ shows its name only."
   "Return the name of VOICE, a string or (NAME . INFO)."
   (if (consp voice) (car voice) voice))
 
-(defun utter-transient--voice-valid-p (voice backend old-backend)
-  "Return non-nil if VOICE can stay selected after switching to BACKEND.
-OLD-BACKEND is the backend VOICE was chosen for."
-  (or (null voice)
-      (if-let* ((voices (utter-backend-voices backend)))
-          (member voice (mapcar #'utter-transient--voice-name voices))
-        (eq backend old-backend))))
+(defun utter-transient--capable-p (capability)
+  "Return non-nil if the menu's backend and model have CAPABILITY.
+Both are read in the buffer the menu was opened from."
+  (when-let* ((backend (utter-transient--backend
+                        (utter-transient--original 'utter-backend))))
+    (utter--capable-p backend
+                      (or (utter-transient--original 'utter-model)
+                          (utter-transient--model-symbol
+                           (car (utter-backend-models backend))))
+                      capability)))
+
+(defconst utter-transient--capabilities
+  '(instructions ssml timestamps stitching clone)
+  "Capabilities that `utter-backend' documents, in display order.")
+
+(defun utter-transient--model-capabilities (backend model)
+  "Return the capabilities of MODEL on BACKEND, as core applies them.
+MODEL is a symbol or (SYMBOL . PLIST)."
+  (let ((name (utter-transient--model-symbol model)))
+    (cl-remove-if-not
+     (lambda (cap) (utter--capable-p backend name cap))
+     (delete-dups
+      (append utter-transient--capabilities
+              (copy-sequence (utter-backend-capabilities backend))
+              (copy-sequence (utter-transient--model-get model :capabilities)))))))
+
+(defun utter-transient--max-chars-string (backend)
+  "Return BACKEND's request limit with its unit, such as \"4096ch\", or nil."
+  (when-let* ((max (utter-backend-max-chars backend)))
+    (format "%d%s" max (pcase (utter-backend-max-chars-unit backend)
+                         ('bytes "B") ('utf16 "u16") (_ "ch")))))
 
 (defun utter-transient--provider-annotation (entry)
   "Return the annotation for provider ENTRY, (NAME BACKEND MODEL).
-Shows description, capabilities, max characters and price per
-million characters from MODEL's plist."
+Shows description, capabilities, the request limit and price per
+million characters; nil when none of them is known."
   (pcase-let* ((`(,_ ,backend ,model) entry)
                (desc (utter-transient--model-get model :description))
-               (caps (or (utter-transient--model-get model :capabilities)
-                         (utter-backend-capabilities backend)))
-               (max-chars (utter-backend-max-chars backend))
+               (caps (utter-transient--model-capabilities backend model))
+               (max-chars (utter-transient--max-chars-string backend))
                (cost (utter-transient--model-get model :cost)))
-    (concat
-     (propertize " " 'display '(space :align-to 40))
-     (truncate-string-to-width (or desc "") 40 nil ?\s t)
-     (propertize " " 'display '(space :align-to 82))
-     (truncate-string-to-width (if caps (mapconcat #'symbol-name caps " ") "")
-                               24 nil ?\s t)
-     (propertize " " 'display '(space :align-to 108))
-     (format "%6s" (if max-chars (number-to-string max-chars) "--"))
-     (propertize " " 'display '(space :align-to 116))
-     (cond ((null cost) "")
-           ((and (numberp cost) (zerop cost)) "free")
-           (t (format "$%s/1M" cost))))))
+    (when (or desc caps max-chars cost)
+      (concat
+       (propertize " " 'display '(space :align-to 40))
+       (truncate-string-to-width (or desc "") 40 nil ?\s t)
+       (propertize " " 'display '(space :align-to 82))
+       (truncate-string-to-width (if caps (mapconcat #'symbol-name caps " ") "")
+                                 24 nil ?\s t)
+       (propertize " " 'display '(space :align-to 108))
+       (format "%8s" (or max-chars "--"))
+       (propertize " " 'display '(space :align-to 118))
+       (cond ((null cost) "")
+             ((and (numberp cost) (zerop cost)) "free")
+             (t (format "$%s/1M" cost)))))))
 
 (defun utter-transient--read-provider (prompt &rest _)
   "Read a backend and model with PROMPT; return (BACKEND MODEL).
 Candidates are \"Backend:model\" for every model of every backend in
 `utter--known-backends', or the backend name for backends without
-models."
+models, grouped by backend."
   (let* ((entries
           (cl-loop
            for (name . backend) in utter--known-backends
@@ -148,10 +188,16 @@ models."
                          models)
            else collect (list name backend nil)))
          (completion-extra-properties
-          `(:annotation-function
+          `(:group-function
+            ,(lambda (candidate transform)
+               (if transform
+                   candidate
+                 (when-let* ((entry (assoc candidate entries)))
+                   (utter-backend-name (nth 1 entry)))))
+            :annotation-function
             ,(lambda (candidate)
-               (utter-transient--provider-annotation
-                (assoc candidate entries)))))
+               (when-let* ((entry (assoc candidate entries)))
+                 (utter-transient--provider-annotation entry)))))
          (current (utter-transient--backend utter-backend))
          (choice (assoc (completing-read
                          prompt entries nil t nil nil
@@ -162,26 +208,32 @@ models."
 
 (defun utter-transient--refresh-menu (&rest _)
   "Redraw `utter-menu' if it is open, to update its heading and columns.
-Called from engine hooks and voice fetches, outside the command loop,
-so errors are demoted to messages.  Does nothing while the minibuffer
-is active."
+Runs from `utter--state-change-hook' and voice fetches, outside the
+command loop, so errors are demoted to messages.  Does nothing when
+the menu is closed, while the minibuffer is active, or while one of
+the menu's own commands runs (transient redraws after it anyway)."
   (when (and transient--prefix
              (eq (oref transient--prefix command) 'utter-menu)
+             (not transient-current-command)
              ;; An infix is reading input; `:refresh-suffixes' redraws
              ;; after the next key instead.
              (not (active-minibuffer-window)))
     (with-demoted-errors "utter: menu refresh failed: %S"
-      (with-current-buffer (if (buffer-live-p transient--original-buffer)
-                               transient--original-buffer
-                             (current-buffer))
-        (transient--refresh-transient)))))
+      (with-current-buffer (utter-transient--source-buffer)
+        (if (fboundp 'transient--env-apply)
+            (transient--env-apply #'transient--refresh-transient)
+          (transient--refresh-transient))))))
 
-(defun utter-transient--voice-candidates (backend)
-  "Return the voices for BACKEND, or nil while they are being fetched.
-Static voices come from the backend.  Otherwise ask
+;; Installed once: the guard makes it a no-op while the menu is closed,
+;; and `C-z' suspend then resume needs no reinstall.
+(add-hook 'utter--state-change-hook #'utter-transient--refresh-menu)
+
+(defun utter-transient--voice-candidates (backend model)
+  "Return the voices for BACKEND and MODEL, or nil while being fetched.
+Known lists come from `utter--static-voices'.  Otherwise ask
 `utter--list-voices'; a cache hit answers at once, a miss starts a
 fetch whose arrival redraws the menu."
-  (or (utter-backend-voices backend)
+  (or (utter--static-voices backend model)
       (when (fboundp 'utter--list-voices)
         (let ((name (utter-backend-name backend))
               returned result)
@@ -200,14 +252,21 @@ fetch whose arrival redraws the menu."
           (setq returned t)
           (unless result
             (message "utter: no voices cached for %s yet, fetching…" name))
-          result))))
+          (and (listp result) result)))))
+
+(defconst utter-transient--default-voice "(backend default)"
+  "Voice candidate that clears `utter-voice'.")
 
 (defun utter-transient--read-voice (_prompt _initial history)
-  "Read a voice for the current backend and model; empty input means nil.
-Any name may be typed, so a voice can be chosen before the list has
-been fetched.  HISTORY is the minibuffer history."
+  "Read a voice for the current backend and model.
+RET keeps the current voice; the candidate named by
+`utter-transient--default-voice', or empty input when no voice is
+set, means nil.  Any name may be typed, so a voice can be chosen
+before the list has been fetched.  HISTORY is the minibuffer
+history."
   (let* ((backend (utter-transient--backend utter-backend))
-         (voices (and backend (utter-transient--voice-candidates backend)))
+         (voices (and backend (utter-transient--voice-candidates
+                               backend utter-model)))
          (completion-extra-properties
           `(:annotation-function
             ,(lambda (candidate)
@@ -216,19 +275,25 @@ been fetched.  HISTORY is the minibuffer history."
          (choice (completing-read
                   (format "Voice for %s (%s): "
                           (utter-transient--provider-string backend utter-model)
-                          (or utter-voice "default"))
-                  (mapcar (lambda (v) (if (consp v) v (list v))) voices)
-                  nil nil nil history)))
-    (if (string-empty-p choice) nil choice)))
+                          (or utter-voice "backend default"))
+                  (append (mapcar (lambda (v) (if (consp v) v (list v))) voices)
+                          (and utter-voice
+                               (list (list utter-transient--default-voice))))
+                  nil nil nil history utter-voice)))
+    (if (or (string-empty-p choice)
+            (equal choice utter-transient--default-voice))
+        nil
+      choice)))
 
 (defun utter-transient--read-format (prompt _initial history)
   "Read an audio format with PROMPT; empty input means the default.
+Candidates are the formats of the current backend and model.
 HISTORY is the minibuffer history."
   (let* ((backend (utter-transient--backend utter-backend))
          (choice (completing-read
                   prompt (mapcar #'symbol-name
-                                 (and backend (utter-backend-formats backend)))
-                  nil nil nil history)))
+                                 (and backend (utter--formats backend utter-model)))
+                  nil t nil history)))
     (if (string-empty-p choice) nil (intern choice))))
 
 (defun utter-transient--read-language (prompt _initial history)
@@ -261,32 +326,65 @@ documentation.  Copied from `gptel--transient-read-number'."
 
 ;;;; Presets
 
-(defvar utter-transient--preset nil
-  "Name of the preset last applied from `utter-menu'.")
-
 (defun utter-transient--read-preset (prompt _initial history)
   "Read the name of a registered preset with PROMPT.
-HISTORY is the minibuffer history."
+Each candidate is annotated with its :description.  HISTORY is the
+minibuffer history."
   (let* ((names (mapcar #'car (bound-and-true-p utter--known-presets)))
+         (completion-extra-properties
+          `(:annotation-function
+            ,(lambda (candidate)
+               (when-let* ((name (cl-find candidate names
+                                          :key (lambda (n) (format "%s" n))
+                                          :test #'equal))
+                           (desc (plist-get (utter-get-preset name)
+                                            :description)))
+                 (concat (propertize " " 'display '(space :align-to 25))
+                         desc)))))
          (choice (completing-read prompt (mapcar (lambda (n) (format "%s" n))
                                                  names)
                                   nil t nil history)))
     (cl-find choice names :key (lambda (n) (format "%s" n)) :test #'equal)))
 
+(defun utter-transient--preset-mismatch-p (preset)
+  "Return non-nil if a setting of PRESET no longer holds.
+PRESET is a name or a spec.  Values are compared in the buffer the
+menu was opened from; parents are checked too."
+  (with-current-buffer (utter-transient--source-buffer)
+    (let ((spec (ignore-errors (utter--preset-spec preset))))
+      (cl-loop
+       for (key val) on spec by #'cddr
+       thereis
+       (pcase key
+         ((or :description :pre :post) nil)
+         (:parents (cl-some #'utter-transient--preset-mismatch-p
+                            (ensure-list val)))
+         (:backend (let ((current (utter-transient--backend utter-backend)))
+                     (not (if (stringp val)
+                              (and current (equal (utter-backend-name current) val))
+                            (eq current val)))))
+         (_ (when-let* ((var (utter--preset-var key)))
+              (not (equal (symbol-value var) val)))))))))
+
 ;;;; Infix classes
 
 (defclass utter-lisp-variable (transient-lisp-variable)
   ((display-nil :initarg :display-nil :initform "(none)")
-   (display-map :initarg :display-map :initform nil))
+   (display-map :initarg :display-map :initform nil)
+   (default :initarg :default :initform nil))
   "A Lisp variable infix that honours `utter--set-scope'.
 DISPLAY-NIL is shown for a nil value; DISPLAY-MAP maps values to
-display strings.")
+display strings.  A value equal to DEFAULT is shown as inactive.")
 
 (cl-defmethod transient-format-value ((obj utter-lisp-variable))
   "Format the value of OBJ, using its display-nil and display-map slots."
-  (with-slots (value display-nil display-map) obj
-    (if (null value)
-        (propertize display-nil 'face 'transient-inactive-value)
+  (with-slots (value display-nil display-map default) obj
+    (if (or (null value) (and default (equal value default)))
+        (propertize (if value
+                        (let ((shown (or (cdr (assoc value display-map)) value)))
+                          (if (stringp shown) shown (prin1-to-string shown)))
+                      display-nil)
+                    'face 'transient-inactive-value)
       (let ((shown (or (cdr (assoc value display-map)) value)))
         (propertize (if (stringp shown) shown (prin1-to-string shown))
                     'face 'transient-value)))))
@@ -298,9 +396,22 @@ display strings.")
            (oset obj value value)
            utter--set-scope))
 
+(defclass utter--text-variable (utter-lisp-variable)
+  ()
+  "A free-text infix shown on one line, truncated to 35 characters.")
+
+(cl-defmethod transient-format-value ((obj utter--text-variable))
+  "Show OBJ's value flattened to one line and truncated."
+  (let ((value (oref obj value)))
+    (if (stringp value)
+        (propertize (truncate-string-to-width
+                     (replace-regexp-in-string "[ \t]*\n[ \t]*" " " value)
+                     35 nil nil t)
+                    'face 'transient-value)
+      (cl-call-next-method))))
+
 (defclass utter-provider-variable (utter-lisp-variable)
-  ((backend :initarg :backend :initform 'utter-backend)
-   (always-read :initform t))
+  ((backend :initarg :backend :initform 'utter-backend))
   "Compound infix that sets `utter-backend' and `utter-model' together.")
 
 (cl-defmethod transient-format-value ((obj utter-provider-variable))
@@ -313,16 +424,16 @@ display strings.")
 
 (cl-defmethod transient-infix-set ((obj utter-provider-variable) value)
   "Set backend and model from VALUE, (BACKEND MODEL), for OBJ.
-Reset `utter-voice' when the old voice does not exist for the new
-backend, then redraw the menu."
+Then clear `utter-voice' when the new backend does not offer it,
+and redraw the menu."
   (pcase-let ((`(,backend ,model) value)
-              (old-backend (utter-transient--backend
-                            (symbol-value (oref obj backend)))))
-    (funcall (oref obj set-value) (oref obj variable)
-             (oset obj value model) utter--set-scope)
-    (funcall (oref obj set-value) (oref obj backend) backend utter--set-scope)
-    (unless (utter-transient--voice-valid-p utter-voice backend old-backend)
-      (funcall (oref obj set-value) 'utter-voice nil utter--set-scope)))
+              (set-value (oref obj set-value)))
+    (funcall set-value (oref obj variable) (oset obj value model)
+             utter--set-scope)
+    (funcall set-value (oref obj backend) backend utter--set-scope)
+    (utter--sanitize-settings
+     backend (lambda (sym val) (funcall set-value sym val utter--set-scope))
+     (list (oref obj variable))))
   (when transient--prefix (transient-setup)))
 
 (defclass utter-voice-variable (utter-lisp-variable)
@@ -345,10 +456,17 @@ backend, then redraw the menu."
     (_ (message "Settings from the menu apply globally") nil)))
 
 (cl-defmethod transient-format-value ((obj utter--scope-variable))
-  "Show the scope name of OBJ."
-  (propertize (alist-get (oref obj value) utter-transient--scope-names
-                         "global" nil #'eql)
-              'face 'transient-value))
+  "Show every scope of OBJ, the active one highlighted."
+  (let ((value (oref obj value)))
+    (concat
+     (propertize "(" 'face 'transient-delimiter)
+     (mapconcat (pcase-lambda (`(,scope . ,name))
+                  (propertize name 'face (if (eql scope value)
+                                             'transient-value
+                                           'transient-inactive-value)))
+                utter-transient--scope-names
+                (propertize "|" 'face 'transient-delimiter))
+     (propertize ")" 'face 'transient-delimiter))))
 
 (cl-defmethod transient-infix-set ((obj utter--scope-variable) value)
   "Set the scope of OBJ to VALUE; the scope itself is always global."
@@ -370,16 +488,26 @@ backend, then redraw the menu."
 
 (defclass utter-preset-variable (utter-lisp-variable)
   ()
-  "Infix that applies a named preset from `utter--known-presets'.")
+  "Infix for `utter--preset' that applies a preset from `utter--known-presets'.")
 
-(cl-defmethod transient-infix-set ((_obj utter-preset-variable) value)
-  "Apply the preset named VALUE with the current scope, then set the infix."
+(cl-defmethod transient-format-value ((obj utter-preset-variable))
+  "Show OBJ's preset, struck through when its settings no longer hold."
+  (let ((value (oref obj value)))
+    (if (null value)
+        (cl-call-next-method)
+      (propertize (format "%s" value)
+                  'face (if (utter-transient--preset-mismatch-p value)
+                            '(:inherit transient-inactive-value :strike-through t)
+                          'transient-value)))))
+
+(cl-defmethod transient-infix-set ((obj utter-preset-variable) value)
+  "Apply the preset named VALUE for OBJ with the current scope, then redraw."
   (when value
-    (utter--apply-preset (utter-get-preset value)
+    (utter--apply-preset value
                          (lambda (sym val)
-                           (utter--set-with-scope sym val utter--set-scope)))
+                           (funcall (oref obj set-value) sym val utter--set-scope)))
     (message "Preset %s applied" value))
-  (cl-call-next-method)
+  (oset obj value value)
   (when transient--prefix (transient-setup)))
 
 ;;;; Infixes
@@ -436,17 +564,19 @@ backend, then redraw the menu."
   :prompt "Language (empty: auto): "
   :variable 'utter-language
   :display-nil "auto"
+  :default 'auto
   :set-value #'utter--set-with-scope
   :reader #'utter-transient--read-language)
 
 (transient-define-infix utter--infix-instructions ()
   "Voice instructions, for backends that accept them."
-  :class 'utter-lisp-variable
+  :class 'utter--text-variable
   :description "Instructions"
   :key "-i"
   :prompt "Instructions (empty: none): "
   :variable 'utter-instructions
   :display-nil "(none)"
+  :inapt-if (lambda () (not (utter-transient--capable-p 'instructions)))
   :set-value #'utter--set-with-scope
   :reader #'utter-transient--read-instructions)
 
@@ -471,12 +601,130 @@ backend, then redraw the menu."
   :description "Preset"
   :key "@"
   :prompt "Preset: "
-  :variable 'utter-transient--preset
+  :variable 'utter--preset
   :display-nil "(none)"
+  :inapt-if (lambda () (null (bound-and-true-p utter--known-presets)))
   :set-value #'utter--set-with-scope
   :reader #'utter-transient--read-preset)
 
+;;;; Live arguments
+
+(defun utter-transient--live-args ()
+  "Return the menu's switches as they are now, also while it is drawn.
+`transient-args' only sees the exported value inside a suffix; while
+the menu is drawn this simulates the export, as gptel does."
+  (or (and transient-current-command
+           (transient-args transient-current-command))
+      (and transient--prefix
+           (eq (oref transient--prefix command) 'utter-menu)
+           ;; HACK: transient internals, for live labels (see
+           ;; `gptel--describe-suffix-send').
+           (let* ((transient-current-command (oref transient--prefix command))
+                  (transient-current-suffixes transient--suffixes))
+             (transient-args transient-current-command)))))
+
 ;;;; Input and output
+
+(defun utter-transient--latest-kill ()
+  "Return the latest kill as a plain string, or nil when there is none.
+Asks `current-kill' like yanking does, so the system clipboard counts."
+  (when-let* ((kill (ignore-errors (current-kill 0 t))))
+    (and (string-match-p "[^ \t\n\r]" kill)
+         (substring-no-properties kill))))
+
+(defun utter-transient--format-seconds (seconds)
+  "Return SECONDS as a rough duration, \"~12 s\" or \"~3 min\"."
+  (if (< seconds 59.5)
+      (format "~%d s" (max 1 (round seconds)))
+    (format "~%d min" (max 1 (round seconds 60)))))
+
+(defun utter-transient--line-range (beg end)
+  "Return \"line N\" or \"lines N-M\" for the text from BEG to END."
+  (let ((first (line-number-at-pos beg))
+        (last (line-number-at-pos (if (and (> end beg)
+                                           (eq (char-before end) ?\n))
+                                      (1- end)
+                                    end))))
+    (if (= first last)
+        (format "line %d" first)
+      (format "lines %d-%d" first last))))
+
+(defun utter-transient--compute-plan (args)
+  "Return a plist describing the text RET would read with ARGS.
+Keys: :label, the source name; :lines, a line range when the text
+comes from the buffer; :seconds, the estimated speaking time; :empty,
+non-nil when there is nothing to read.  Never signals."
+  (condition-case nil
+      (cond
+       ((member "m" args) (list :label "minibuffer" :what "minibuffer input"))
+       ((member "y" args)
+        (if-let* ((kill (utter-transient--latest-kill)))
+            (let ((label (concat "kill-ring " (utter--short-name kill))))
+              (list :label label :what label
+                    :seconds (utter--estimate-seconds kill utter-speed)))
+          (list :label "kill ring empty" :empty t)))
+       (t
+        (pcase-let ((`(,beg ,end ,label) (utter--input-candidate)))
+          (if (utter--blank-p beg end)
+              (list :label "nothing" :empty t)
+            (list :label label :what label
+                  :lines (utter-transient--line-range beg end)
+                  :seconds (utter--estimate-seconds
+                            (buffer-substring-no-properties beg end)
+                            utter-speed))))))
+    (error (list :label "nothing" :empty t))))
+
+(defvar utter-transient--plan-cache nil
+  "The last input plan, as (KEY . PLAN); see `utter-transient--plan'.")
+
+(defun utter-transient--plan (args)
+  "Return the input plan for ARGS, computed once per menu redraw.
+The Input heading and the RET label both ask; the plan is reused
+while the source buffer, point, mark, region, kill and ARGS stay
+the same."
+  (with-current-buffer (utter-transient--source-buffer)
+    (let ((key (list (current-buffer) (buffer-chars-modified-tick) (point)
+                     (mark t) (use-region-p) args (car kill-ring)
+                     utter-speed utter-input-functions)))
+      (if (equal key (car utter-transient--plan-cache))
+          (cdr utter-transient--plan-cache)
+        (let ((plan (utter-transient--compute-plan args)))
+          (setq utter-transient--plan-cache (cons key plan))
+          plan)))))
+
+(defun utter-transient--input-description ()
+  "Describe the Input group with the source RET would read."
+  (let ((plan (utter-transient--plan (utter-transient--live-args))))
+    (concat (propertize " <Read from " 'face 'transient-heading)
+            (propertize (plist-get plan :label)
+                        'face (if (plist-get plan :empty) 'error 'warning)))))
+
+(defun utter-transient--describe-speak ()
+  "Describe what RET sends: the text, its size and where it goes."
+  (let* ((args (utter-transient--live-args))
+         (plan (utter-transient--plan args))
+         (state (and (fboundp 'utter-state) (utter-state)))
+         (active (and state (not (memq (plist-get state :status) '(nil idle)))))
+         (seconds (plist-get plan :seconds))
+         (lines (plist-get plan :lines)))
+    (cl-flet ((source (&optional no-time)
+                (let ((details (delq nil (list lines
+                                               (and seconds (not no-time)
+                                                    (utter-transient--format-seconds
+                                                     seconds))))))
+                  (concat (propertize (plist-get plan :what) 'face 'warning)
+                          (and details
+                               (format " (%s)" (string-join details ", ")))))))
+      (cond
+       ((plist-get plan :empty)
+        (propertize "Nothing to read aloud" 'face 'error))
+       ((member "f" args) (concat "Save " (source t) " to file"))
+       ((member "c" args) (concat "Synthesize " (source) ", cache only"))
+       ((member "S" args)
+        (concat "Speak " (source) (and active ", interrupt now")))
+       (active (format "Speak %s, append as utterance %d"
+                       (source) (1+ (or (plist-get state :total) 0))))
+       (t (concat "Speak " (source)))))))
 
 (defun utter-transient--default-input ()
   "Return (TEXT . PARAMS) chosen the way `utter-speak' chooses.
@@ -488,11 +736,14 @@ the buffer up to point; see `utter--text-at-point'."
 
 (defun utter-transient--input (args)
   "Return (TEXT . PARAMS) for the input switch in ARGS.
-Without a switch the text is chosen like `utter-speak' does."
+Without a switch the text is chosen like `utter-speak' does.  With
+the `y' switch and a prefix argument, pick an older kill."
   (cond
    ((member "y" args)
-    (let ((text (and (or kill-ring interprogram-paste-function)
-                     (substring-no-properties (current-kill 0)))))
+    (let ((text (if (and current-prefix-arg kill-ring)
+                    (substring-no-properties
+                     (read-from-kill-ring "Read aloud from kill-ring: "))
+                  (utter-transient--latest-kill))))
       (when (or (null text) (string-blank-p text))
         (user-error "Nothing to read aloud: the kill ring is empty"))
       (list text :source-name "kill-ring")))
@@ -503,23 +754,26 @@ Without a switch the text is chosen like `utter-speak' does."
       (list text :source-name "minibuffer")))
    (t (utter-transient--default-input))))
 
-(defun utter-transient--input-description ()
-  "Describe the Input group with the source RET would read."
-  (format "Input < %s"
-          (with-current-buffer (if (buffer-live-p transient--original-buffer)
-                                   transient--original-buffer
-                                 (current-buffer))
-            (utter-input-label))))
+(defun utter-transient--save-file-name (params)
+  "Return the default file name for saving audio of PARAMS.
+The name of the source without its extension plus the format that
+would be requested, such as \"notes.mp3\"."
+  (let* ((backend (utter-transient--backend utter-backend))
+         (format (or utter-format
+                     (and backend (car (utter--formats backend utter-model)))))
+         (base (file-name-sans-extension
+                (or (plist-get params :source-name) "utter"))))
+    (concat (replace-regexp-in-string "[/\\:*?\"<>|]" "_" base)
+            (and format (format ".%s" format)))))
 
-(defun utter-transient--describe-speak ()
-  "Describe the RET suffix, with the queue position while playing."
-  (let ((state (and (fboundp 'utter-state) (utter-state)))
-        (args (and transient--prefix (ignore-errors (transient-args 'utter-menu)))))
-    (if (and state (not (memq (plist-get state :status) '(nil idle)))
-             (not (cl-intersection args '("S" "f" "c") :test #'equal)))
-        (format "Speak (appends as utterance %d)"
-                (1+ (or (plist-get state :total) 0)))
-      "Speak")))
+(defun utter-transient--save (text params)
+  "Save the audio of TEXT with PARAMS to a file read from the minibuffer.
+Check that TEXT fits one request before asking for the file name."
+  (utter--single-segment text (utter--snapshot-params nil text))
+  (let ((default (utter-transient--save-file-name params)))
+    (utter-save-to-file text (read-file-name
+                              (format-prompt "Save audio to" default)
+                              nil default))))
 
 (transient-define-suffix utter--suffix-speak (args)
   "Read aloud the text chosen by the input switch in ARGS.
@@ -530,33 +784,20 @@ this is `utter-speak': region or text at point, appended."
   :description #'utter-transient--describe-speak
   (interactive (list (transient-args (or transient-current-command 'utter-menu))))
   (pcase-let ((`(,text . ,params) (utter-transient--input args)))
-    (when (or (null text) (string-empty-p (string-trim text)))
-      (user-error "Nothing to read aloud"))
     (cond
      ((member "S" args) (apply #'utter-interrupt text params))
-     ((member "f" args)
-      (utter-save-to-file text (read-file-name "Save audio to: ")))
+     ((member "f" args) (utter-transient--save text params))
      ((member "c" args) (apply #'utter-enqueue text :cache-only t params))
      (t (apply #'utter-enqueue text params)))))
 
 (transient-define-suffix utter--suffix-inspect (args)
-  "Show the request the menu would send for ARGS, without sending it."
+  "Show the request RET would send for ARGS, without sending it."
   :key "I"
   :description "Inspect"
   (interactive (list (transient-args (or transient-current-command 'utter-menu))))
-  (let* ((text (car (utter-transient--input args)))
-         (backend (utter-transient--backend utter-backend))
-         (max (and backend (utter-backend-max-chars backend)))
-         (request (utter-request (if (and max (> (length text) max))
-                                     (substring text 0 max)
-                                   text)
-                                 :dry-run t)))
-    (with-current-buffer (get-buffer-create "*utter-inspect*")
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert (pp-to-string request)))
-      (lisp-data-mode)
-      (display-buffer (current-buffer)))))
+  (let ((text (car (utter-transient--input args))))
+    (with-current-buffer (utter-transient--source-buffer)
+      (utter--inspect-text text))))
 
 ;;;; Evil
 
@@ -576,12 +817,13 @@ Copied from `gptel--transient-fix-evil-visual'."
           (evil-visual-contract-region)))
     (funcall fn)))
 
-;;;; Heading and live refresh
+;;;; Heading
 
 (defun utter--menu-heading ()
   "Return the heading of `utter-menu' for the current playback state.
 Either \"Idle\" or, for example,
-\"Playing notes.org (2/5) · OpenAI:gpt-4o-mini-tts/nova · 1.0x\"."
+\"Playing notes.org (2/5) · OpenAI:gpt-4o-mini-tts/nova\".  The
+rate is shown once, on the rate-up key."
   (let* ((state (utter-state))
          (status (plist-get state :status)))
     (propertize
@@ -589,31 +831,15 @@ Either \"Idle\" or, for example,
          "Idle"
        (let ((model (plist-get state :model))
              (voice (plist-get state :voice)))
-         (format "%s %s (%s/%s) · %s%s%s · %s"
+         (format "%s %s (%s/%s) · %s%s%s"
                  (capitalize (symbol-name status))
                  (or (plist-get state :source) "utterance")
                  (or (plist-get state :index) 1)
                  (or (plist-get state :total) 1)
                  (or (utter-mode--backend-name (plist-get state :backend)) "?")
                  (if model (format ":%s" model) "")
-                 (if voice (concat "/" voice) "")
-                 (utter-mode--format-rate (plist-get state :rate)))))
+                 (if voice (concat "/" voice) ""))))
      'face 'transient-heading)))
-
-(defun utter-transient--remove-refresh ()
-  "Stop refreshing the menu once it has really closed."
-  (unless transient--prefix
-    (remove-hook 'utter-progress-functions #'utter-transient--refresh-menu)
-    (remove-hook 'utter-queue-finished-hook #'utter-transient--refresh-menu)
-    (remove-hook 'transient-exit-hook #'utter-transient--remove-refresh)))
-
-(defun utter-transient--install-refresh ()
-  "Refresh the menu while it is open.
-Progress updates the heading; the end of the queue hides the
-Playback column."
-  (add-hook 'utter-progress-functions #'utter-transient--refresh-menu)
-  (add-hook 'utter-queue-finished-hook #'utter-transient--refresh-menu)
-  (add-hook 'transient-exit-hook #'utter-transient--remove-refresh))
 
 ;;;; The menu
 
@@ -621,7 +847,7 @@ Playback column."
 (transient-define-prefix utter-menu ()
   "Read text aloud: settings, input, output and playback control."
   :refresh-suffixes t
-  :incompatible '(("m" "y") ("s" "S" "f" "c"))
+  :incompatible '(("m" "y") ("S" "f" "c"))
   [:description utter--menu-heading
    ["Backend"
     (utter--infix-provider)
@@ -638,8 +864,8 @@ Playback column."
    [:description utter-transient--input-description
     ("m" "Minibuffer instead" "m")
     ("y" "Kill-ring instead" "y")]
-   ["Output >"
-    ("s" "Speakers, append (default)" "s")
+   ;; Appending is the default and has no switch; RET says so.
+   [" >Output to"
     ("S" "Speakers, interrupt" "S")
     ("f" "Save to file" "f")
     ("c" "Cache only" "c")]
@@ -654,15 +880,19 @@ Playback column."
     ("_" "Rate down" utter-rate-down :transient t)
     ("x" "Clear pending" utter-clear :transient t)
     ("q" "Stop all" utter-stop :transient t)
-    ("Q" "Queue buffer" utter-queue :transient t)]]
+    ;; Exits: the queue buffer has keys of its own.
+    ("Q" "Queue buffer" utter-queue)]]
   [(utter--suffix-speak)
-   (utter--suffix-inspect :if (lambda () utter-expert-commands))]
+   (utter--suffix-inspect
+    :if (lambda () (or utter-expert-commands utter-log-level)))]
   (interactive)
-  (utter-transient--install-refresh)
+  (utter--sanitize-settings)
   (transient-setup 'utter-menu))
 
-;; The `environment' slot appeared in transient 0.7.8; Emacs 30.1
-;; bundles 0.7.2.2.  Attach the evil fix only where the slot exists.
+;; The `environment' slot appeared in transient 0.7.8, but Emacs 30.1
+;; bundles 0.7.2.2, whose `transient-define-prefix' rejects the keyword
+;; (invalid-slot-name) when `-Q' loads the bundled copy.  So attach the
+;; evil fix only where the slot exists.
 (when (slot-exists-p 'transient-prefix 'environment)
   (oset (get 'utter-menu 'transient--prefix) environment
         #'utter--transient-fix-evil-visual))

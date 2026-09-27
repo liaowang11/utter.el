@@ -295,37 +295,85 @@ other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
 
 ### UI (UI owner)
 
-`utter-menu` layout (keys are final):
+`utter-menu` layout (keys are final; 2026-09-28 Bill dropped `s`, retitled
+Input/Output gptel-style, and moved the rate to the rate-up label only):
 
 ```
-[:description utter--menu-heading]          ; "Idle" | "Playing reading-aloud.org (2/5) · OpenAI:gpt-4o-mini-tts/nova · 1.0x"
+[:description utter--menu-heading          ; "Idle" | "Playing reading-aloud.org (2/5) · OpenAI:gpt-4o-mini-tts/nova"
  ["Backend"  -m Backend:model  -v Voice  -s Speed  -f Format  -l Language  -i Instructions
-             -H Highlight spoken text  = Scope  @ Preset]
- ["Input < <label>"  m Minibuffer instead  y Kill-ring instead]   ; label = what RET reads: region / gptel response / Org subtree / page / buffer to point / whole buffer / nothing
- ["Output >" s Speakers, append (default)  S Speakers, interrupt  f Save to file  c Cache only]
- ["Playback" :if utter-active-p            ; every suffix :transient t
-             SPC Pause/resume  n Next utterance  p Previous utterance  +/_ Rate  x Clear pending  q Stop all  Q Queue buffer]
-             ; rate-down is `_' in the menu because transient cannot bind `-' next to the `-m' `-v' ... infixes; utter-mode-map keeps `-'
- [RET Speak   I Inspect (:if utter-expert-commands)]
+             -H Highlight spoken text  = Scope (global|buffer|oneshot)  @ Preset]
+ [" <Read from <label>"  m Minibuffer instead  y Kill-ring instead]
+     ; label = what RET reads: region / gptel response / Org subtree / page / buffer to point /
+     ; whole buffer / nothing; `minibuffer' with m; `kill-ring "first words…"' or
+     ; `kill ring empty' (error face) with y
+ [" >Output to"  S Speakers, interrupt  f Save to file  c Cache only]   ; append is the default, no switch
+ ["Playback" :if utter-active-p
+             SPC Pause/resume  n Next utterance  p Previous utterance  + Rate up (1.0x)  _ Rate down
+             x Clear pending  q Stop all  Q Queue buffer]
+             ; every suffix but Q is :transient t; Q exits, since the queue buffer has keys of its own
+             ; rate-down is `_' because `-' is the prefix of `-m' `-v' ...; utter-mode-map has both
+ [RET <what will be sent>   I Inspect (:if utter-expert-commands or utter-log-level)]]
 ```
 
-- `:refresh-suffixes t`; `:incompatible` groups for input and for output
-  switches. Playback suffixes call the ENGINE commands directly.
+- `RET`'s label states source, size and destination, computed from the
+  live switches: `Speak region (lines 9-10, ~12 s), append as utterance 4`
+  (while something plays; plain `Speak region (…)` when idle),
+  `Speak buffer to point (lines 1-42, ~3 min), interrupt now`,
+  `Save Org subtree (lines 5-30) to file`,
+  `Synthesize page (lines 1-80, ~4 min), cache only`,
+  `Speak minibuffer input`, `Speak kill-ring "first words…" (~5 s)`, or
+  `Nothing to read aloud` in the `error` face.  The estimate is
+  `utter--estimate-seconds` with `utter-speed`, as in the queued message.
+  The input plan is computed once per redraw (memoized on buffer, tick,
+  point, mark, region, switches and kill) and description functions never
+  signal.
+- Live switches while drawing: `transient-args` sees only the exported
+  value inside a suffix, so `utter-transient--live-args` binds
+  `transient-current-command` and `transient-current-suffixes` as gptel
+  does.  `transient-get-value` is not used (not documented API in 0.7.8).
+- `:refresh-suffixes t`; `:incompatible '(("m" "y") ("S" "f" "c"))`.
+  Playback suffixes call the ENGINE commands directly.
 - `utter--suffix-speak (args)` is the single dispatch: input switch → text,
   output switch → `utter-enqueue` / `utter-interrupt` /
   `utter-save-to-file` / cache-only (`:cache-only t` param). It must be
-  callable non-interactively with `nil`.
-- Infix classes: `utter-lisp-variable` (display-nil, display-map, scope
-  aware), `utter-provider-variable` (compound backend+model, resets voice
-  when invalid, `(transient-setup)` to redraw), `utter-voice-variable`
-  (dependent on backend/model; async fetch on cache miss, free-form input
-  allowed). Numeric reader copied from `gptel--transient-read-number`.
-- Heading refresh while the menu is open: use `transient--refresh-transient`
-  guarded by `(and transient--prefix (eq (oref transient--prefix command) 'utter-menu))`.
-  `transient--refresh` does not exist in transient 0.13.7. Verify
-  `:refresh-suffixes` exists in the transient bundled with Emacs 30.1; if
-  not, declare a `transient` minimum in `Package-Requires`.
-- Evil: copy gptel's visual-state `:environment` fix, guarded by `fboundp`.
+  callable non-interactively with `nil`.  `C-u` with `y` picks an older
+  kill with `read-from-kill-ring`.  `f` checks that the text fits one
+  request before asking for the file, and offers `<source>.<format>`.
+- `I` resolves the text like `RET` and calls `utter--inspect-text` in the
+  source buffer, so the dry run is exactly what `RET` would send.
+- `utter-menu` runs `utter--sanitize-settings` before `transient-setup`,
+  and `-m` runs it after changing the backend, so a model or voice the
+  backend does not offer is neither shown nor sent.
+- Infix classes: `utter-lisp-variable` (display-nil, display-map, and a
+  `default` shown inactive, e.g. `-l auto`; scope aware),
+  `utter--text-variable` (`-i`: one line, 35 chars),
+  `utter-provider-variable` (compound backend+model, completion grouped by
+  backend, annotation with description, capabilities as `utter--capable-p`
+  sees them, `4096ch` limit and cost; `(transient-setup)` to redraw),
+  `utter-voice-variable` (voices from `utter--static-voices` for the
+  backend and model, else an async fetch on cache miss; free-form input
+  allowed; RET keeps the current voice, the `(backend default)` candidate
+  clears it), `utter-preset-variable` (reads the engine's `utter--preset`;
+  struck through when a setting of the preset spec no longer holds; reader
+  annotated with `:description`), `utter--scope-variable`,
+  `utter--toggle-variable`.  `-f` completes with `require-match` over
+  `utter--formats` for the backend and model.  `-i` is `:inapt-if` the
+  model lacks `instructions`; `@` is `:inapt-if` no presets exist.  Numeric
+  reader copied from `gptel--transient-read-number`.
+- Heading refresh while the menu is open: `utter-transient--refresh-menu`
+  sits on `utter--state-change-hook` from load time (a hook removed on
+  `transient-exit-hook` would be lost on `C-z` suspend, which
+  `transient-resume` never reinstalls).  It redraws with
+  `transient--refresh-transient` wrapped in `transient--env-apply` when
+  that exists, guarded by `(and transient--prefix (eq (oref transient--prefix
+  command) 'utter-menu))`, and skips while the minibuffer is active or a
+  menu suffix runs (`transient-current-command` non-nil; post-command
+  redraws then).  `transient--refresh` does not exist in transient 0.13.7.
+- Evil: gptel's visual-state `:environment` fix, guarded by `fboundp`.  It
+  is attached with `oset` only when the `environment` slot exists: the
+  transient bundled with Emacs 30.1 (0.7.2.2, loaded by `emacs -Q` in CI)
+  rejects `:environment` in `transient-define-prefix` with
+  `invalid-slot-name`.
 - `utter-mode`: buffer-local minor mode, no lighter, sets
   `header-line-format` to `(:eval (utter--header-line))` and restores the
   old one on exit. `utter-mode-map`: `SPC` pause, `n`/`p` utterance,
