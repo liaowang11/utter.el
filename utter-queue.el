@@ -48,6 +48,13 @@
 (declare-function utter-backend-max-chars "utter-core" (backend))
 (declare-function utter-backend-max-chars-unit "utter-core" (backend))
 (declare-function utter-backend-capabilities "utter-core" (backend))
+(declare-function utter--resolve-backend "utter-core" (backend))
+(declare-function utter--model-name "utter-core" (model))
+(declare-function utter--model-plist "utter-core" (backend model))
+(declare-function utter--voice-name "utter-core" (voice))
+(declare-function utter--formats "utter-core" (backend &optional model))
+(declare-function utter--capable-p "utter-core" (backend model capability))
+(declare-function utter-cache-prune "utter-core" (&optional max-size))
 
 ;;;; Options (defined in utter.el)
 
@@ -110,7 +117,12 @@ The result is passed as :context to backends that have the
 
 ;;;; Data
 
-(cl-defstruct (utter-item (:constructor utter--make-item) (:copier nil))
+(cl-defstruct (utter-item (:constructor utter--make-item)
+                          (:constructor make-utter-item
+                                        (&key id text status params source-buffer
+                                              source-name markers tick created
+                                              segments (position 0)))
+                          (:copier nil))
   "One utterance: the text of one speak request and its state.
 STATUS is one of `pending', `playing', `paused', `done', `error'
 or `interrupted'.  The `segments' and `position' slots are
@@ -139,14 +151,14 @@ item text."
 (gv-define-setter utter--item-position (value item)
   `(setf (utter-item-position ,item) ,value))
 
-(cl-defstruct (utter--queue (:constructor utter--make-queue) (:copier nil))
+(cl-defstruct (utter--qstate (:constructor utter--make-qstate) (:copier nil))
   "The playback queue.  Private.
 ITEMS is every utterance still listed, oldest first.  RUN is the
 utterances counted by the lighter since the queue was last idle."
   items current process paused run timers active announced
   (played 0) seg-start pause-start (paused-total 0) error-code)
 
-(defvar utter--queue (utter--make-queue)
+(defvar utter--queue (utter--make-qstate)
   "The global queue.")
 
 (defvar utter--item-counter 0
@@ -236,11 +248,6 @@ PLAYER is a player or a symbol whose value is one."
 
 ;;;; Helpers
 
-(defun utter--first (list)
-  "Return the first name in LIST, whose entries may be conses."
-  (let ((x (car-safe list)))
-    (if (consp x) (car x) x)))
-
 (defun utter--format-symbol (format)
   "Return FORMAT as a lower-case symbol, or nil."
   (cond ((null format) nil)
@@ -274,6 +281,12 @@ PLAYER is a player or a symbol whose value is one."
   "Show ERROR with `message'."
   (message "utter: %s" error))
 
+(defun utter--prune-cache ()
+  "Keep the audio cache under its size limit."
+  (when (fboundp 'utter-cache-prune)
+    (with-demoted-errors "utter: cache prune failed: %S"
+      (utter-cache-prune))))
+
 (defun utter--notify (body)
   "Pass BODY to `utter-notify-function', if set."
   (when utter-notify-function
@@ -289,34 +302,32 @@ the spoken text can be highlighted in the buffer."
 
 ;;;; Parameters
 
-(defun utter--resolve-backend (backend)
-  "Return the backend object for BACKEND, a backend or a name."
-  (let ((b (if (stringp backend)
-               (or (utter-get-backend backend)
-                   (user-error "Unknown backend %s" backend))
-             backend)))
-    (or b (user-error "No backend; set `utter-backend', for example \
-with `utter-make-openai'"))))
-
-(defun utter--resolve-params (params text)
+(defun utter--snapshot-params (params text)
   "Resolve PARAMS against the current options for TEXT.
 Return a plist of request keys plus :cache-only."
   (cl-flet ((get (key default)
               (if (plist-member params key) (plist-get params key) default)))
     (let* ((backend (utter--resolve-backend (get :backend utter-backend)))
+           (model (let ((m (or (get :model utter-model)
+                               (utter--model-name (car (utter-backend-models backend))))))
+                    (if (stringp m) (intern m) m)))
            (language (get :language utter-language))
            (lang (if (memq language '(nil auto)) (utter--guess-language text) language))
+           ;; Only declared voice lists give a default; a fetched list
+           ;; has no meaningful first entry.
+           (declared (let ((mv (plist-get (utter--model-plist backend model) :voices))
+                           (bv (utter-backend-voices backend)))
+                       (cond ((consp mv) mv) ((consp bv) bv))))
            (voice (or (get :voice utter-voice)
                       (and (symbolp lang) (alist-get lang utter-voice-alist))
-                      (utter--first (utter-backend-voices backend)))))
+                      (utter--voice-name (car declared)))))
       (list :backend backend
-            :model (or (get :model utter-model)
-                       (utter--first (utter-backend-models backend)))
+            :model model
             :voice voice
             :speed (or (get :speed utter-speed) 1.0)
             :format (utter--format-symbol
                      (or (get :format utter-format)
-                         (utter--first (utter-backend-formats backend))))
+                         (car (utter--formats backend model))))
             :language (unless (eq language 'auto) language)
             :instructions (get :instructions utter-instructions)
             :cache (get :cache t)
@@ -338,7 +349,7 @@ Return a plist of request keys plus :cache-only."
   (let* ((p (utter-item-params item))
          (backend (plist-get p :backend))
          (args (utter--params-args p)))
-    (if (memq 'stitching (utter-backend-capabilities backend))
+    (if (utter--capable-p backend (plist-get p :model) 'stitching)
         (append args (list :context (funcall utter--segment-context-function
                                              item (utter--segment-index seg))))
       args)))
@@ -382,7 +393,7 @@ when the tags did not survive preprocessing."
   "Snapshot TEXT and PARAMS into a new `utter-item'."
   (let* ((buffer (let ((b (plist-get params :source-buffer)))
                    (and b (get-buffer b))))
-         (resolved (utter--resolve-params params text))
+         (resolved (utter--snapshot-params params text))
          (backend (plist-get resolved :backend))
          (processed (utter--preprocess text buffer))
          (pieces (utter--split processed
@@ -420,9 +431,9 @@ when the tags did not survive preprocessing."
 (defun utter--status ()
   "Return the queue status: idle, synthesizing, playing or paused."
   (let ((q utter--queue))
-    (cond ((not (utter--queue-current q)) 'idle)
-          ((utter--queue-paused q) 'paused)
-          ((utter--queue-process q) 'playing)
+    (cond ((not (utter--qstate-current q)) 'idle)
+          ((utter--qstate-paused q) 'paused)
+          ((utter--qstate-process q) 'playing)
           (t 'synthesizing))))
 
 (defun utter-active-p ()
@@ -432,11 +443,11 @@ when the tags did not survive preprocessing."
 (defun utter--elapsed ()
   "Return the seconds played of the current utterance."
   (let ((q utter--queue))
-    (+ (utter--queue-played q)
-       (if (and (utter--queue-process q) (utter--queue-seg-start q))
-           (- (or (utter--queue-pause-start q) (float-time))
-              (utter--queue-seg-start q)
-              (utter--queue-paused-total q))
+    (+ (utter--qstate-played q)
+       (if (and (utter--qstate-process q) (utter--qstate-seg-start q))
+           (- (or (utter--qstate-pause-start q) (float-time))
+              (utter--qstate-seg-start q)
+              (utter--qstate-paused-total q))
          0))))
 
 (defun utter--item-duration (item)
@@ -450,17 +461,17 @@ Keys: :status (idle, synthesizing, playing or paused) :item :index
 :total :elapsed :duration :pending :backend :model :voice :rate
 :source.  :index and :total count utterances."
   (let* ((q utter--queue)
-         (item (utter--queue-current q))
+         (item (utter--qstate-current q))
          (params (and item (utter-item-params item)))
          (backend (if item (plist-get params :backend) utter-backend))
-         (run (utter--queue-run q)))
+         (run (utter--qstate-run q)))
     (list :status (utter--status)
           :item item
           :index (if item (1+ (or (cl-position item run) 0)) 0)
           :total (length run)
           :elapsed (and item (utter--elapsed))
           :duration (and item (utter--item-duration item))
-          :pending (cl-count 'pending (utter--queue-items q) :key #'utter-item-status)
+          :pending (cl-count 'pending (utter--qstate-items q) :key #'utter-item-status)
           :backend (cond ((stringp backend) backend)
                          ((and backend (utter-backend-p backend))
                           (utter-backend-name backend)))
@@ -491,6 +502,39 @@ FORMAT defaults to \"%s %i/%n\"."
                   "-:--"))
          (?S . ,(str (plist-get st :source))))))))
 
+;;;; Queue contents
+
+(defun utter--queue-items ()
+  "Return the listed utterances: finished ones, the current one, then pending.
+Within each group the queue order is kept."
+  (let ((cur (utter--qstate-current utter--queue)))
+    (cl-stable-sort (copy-sequence (utter--qstate-items utter--queue)) #'<
+                    :key (lambda (item)
+                           (cond ((eq item cur) 1)
+                                 ((eq (utter-item-status item) 'pending) 2)
+                                 (t 0))))))
+
+(defun utter--drop-items (items)
+  "Remove ITEMS from the queue, aborting their requests."
+  (let ((q utter--queue))
+    (dolist (item items)
+      (utter--abort-item item)
+      (utter--highlight-drop item))
+    (setf (utter--qstate-items q) (cl-remove-if (lambda (i) (memq i items))
+                                                (utter--qstate-items q))
+          (utter--qstate-run q) (cl-remove-if (lambda (i) (memq i items))
+                                              (utter--qstate-run q)))))
+
+(defun utter--queue-remove (item)
+  "Remove ITEM from the queue if it is pending.
+Other utterances stay; a message says why."
+  (if (and (eq (utter-item-status item) 'pending)
+           (not (eq item (utter--qstate-current utter--queue))))
+      (progn (utter--drop-items (list item))
+             (message "utter: removed %s" (utter-item-source-name item))
+             (utter--schedule))
+    (message "utter: only pending utterances can be removed")))
+
 ;;;; Lighter
 
 (defconst utter--lighter-construct '(:eval (utter--lighter-string))
@@ -500,8 +544,8 @@ FORMAT defaults to \"%s %i/%n\"."
   "Return the lighter for the current state, or nil when idle."
   (when (and utter-lighter (utter-active-p))
     (let* ((status (utter--status))
-           (code (utter--queue-error-code utter--queue))
-           (fmt (if (<= (length (utter--queue-run utter--queue)) 1)
+           (code (utter--qstate-error-code utter--queue))
+           (fmt (if (<= (length (utter--qstate-run utter--queue)) 1)
                     (replace-regexp-in-string "%i/%n" "" utter-lighter t t)
                   utter-lighter)))
       (concat (utter-state-string fmt)
@@ -554,7 +598,7 @@ FORMAT defaults to \"%s %i/%n\"."
 
 (defun utter--highlight-after-change (&rest _)
   "Drop highlights of utterances whose source buffer was edited."
-  (dolist (item (utter--queue-items utter--queue))
+  (dolist (item (utter--qstate-items utter--queue))
     (when (and (utter-item-markers item)
                (eq (utter-item-source-buffer item) (current-buffer))
                (utter--highlight-stale-p item))
@@ -562,7 +606,7 @@ FORMAT defaults to \"%s %i/%n\"."
   (unless (cl-some (lambda (item) (and (utter-item-markers item)
                                        (eq (utter-item-source-buffer item)
                                            (current-buffer))))
-                   (utter--queue-items utter--queue))
+                   (utter--qstate-items utter--queue))
     (remove-hook 'after-change-functions #'utter--highlight-after-change t)))
 
 (defun utter--highlight-progress (item _start _end)
@@ -602,7 +646,7 @@ FORMAT defaults to \"%s %i/%n\"."
   (setf (utter--segment-status seg) 'error
         (utter--segment-error seg) error
         (utter--segment-request seg) nil
-        (utter--queue-error-code utter--queue) (or code t))
+        (utter--qstate-error-code utter--queue) (or code t))
   (let ((text (format "%s%s: %s" (utter--backend-name item)
                       (if code (format " %s" code) "") error)))
     (run-hook-with-args 'utter-error-functions item text)
@@ -611,7 +655,7 @@ FORMAT defaults to \"%s %i/%n\"."
 
 (defun utter--live-item-p (item)
   "Return non-nil if ITEM is current or pending in the queue."
-  (and (memq item (utter--queue-items utter--queue))
+  (and (memq item (utter--qstate-items utter--queue))
        (memq (utter-item-status item) '(pending playing paused))))
 
 (defun utter--segment-callback (item seg audio info)
@@ -639,7 +683,7 @@ FORMAT defaults to \"%s %i/%n\"."
               (message "utter: %s %s, retrying in %s s"
                        (utter--backend-name item) code delay)
               (push (run-at-time delay nil #'utter--retry seg)
-                    (utter--queue-timers utter--queue)))
+                    (utter--qstate-timers utter--queue)))
           (utter--segment-failed item seg error code)))))
     (utter--schedule)))
 
@@ -677,12 +721,12 @@ FORMAT defaults to \"%s %i/%n\"."
 (defun utter--prefetch ()
   "Request segments ahead of playback, within the configured limits."
   (let* ((q utter--queue)
-         (current (utter--queue-current q))
+         (current (utter--qstate-current q))
          (window-size (1+ (max 0 utter-prefetch-depth)))
          (max-flight (max 1 utter-max-concurrent-requests))
          (in-flight 0)
          (window 0))
-    (dolist (item (utter--queue-items q))
+    (dolist (item (utter--qstate-items q))
       (dolist (seg (utter--item-segments item))
         ;; A segment waiting to retry keeps its slot.
         (when (memq (utter--segment-status seg) '(synthesizing retry))
@@ -692,7 +736,7 @@ FORMAT defaults to \"%s %i/%n\"."
                           (cl-remove-if-not
                            (lambda (i) (and (not (eq i current))
                                             (eq (utter-item-status i) 'pending)))
-                           (utter--queue-items q))))
+                           (utter--qstate-items q))))
         (when item
           (dolist (seg (nthcdr (if (eq item current) (utter--item-position item) 0)
                                (utter--item-segments item)))
@@ -709,26 +753,26 @@ FORMAT defaults to \"%s %i/%n\"."
 
 (defun utter--run-index (item)
   "Return the 1-based index of ITEM among the utterances of this run."
-  (1+ (or (cl-position item (utter--queue-run utter--queue)) 0)))
+  (1+ (or (cl-position item (utter--qstate-run utter--queue)) 0)))
 
 (defun utter--start-item (item)
   "Make ITEM the current utterance."
   (let ((q utter--queue))
-    (setf (utter--queue-current q) item
-          (utter--queue-played q) 0
-          (utter--queue-error-code q) nil
-          (utter-item-status item) (if (utter--queue-paused q) 'paused 'playing))
-    (unless (memq item (utter--queue-run q))
-      (setf (utter--queue-run q) (append (utter--queue-run q) (list item))))))
+    (setf (utter--qstate-current q) item
+          (utter--qstate-played q) 0
+          (utter--qstate-error-code q) nil
+          (utter-item-status item) (if (utter--qstate-paused q) 'paused 'playing))
+    (unless (memq item (utter--qstate-run q))
+      (setf (utter--qstate-run q) (append (utter--qstate-run q) (list item))))))
 
 (defun utter--account-segment ()
   "Add the play time of the current segment to the utterance total."
   (let ((q utter--queue))
-    (when (utter--queue-seg-start q)
-      (setf (utter--queue-played q) (utter--elapsed)
-            (utter--queue-seg-start q) nil
-            (utter--queue-pause-start q) nil
-            (utter--queue-paused-total q) 0))))
+    (when (utter--qstate-seg-start q)
+      (setf (utter--qstate-played q) (utter--elapsed)
+            (utter--qstate-seg-start q) nil
+            (utter--qstate-pause-start q) nil
+            (utter--qstate-paused-total q) 0))))
 
 (defun utter--finish-item (item)
   "Finish the current utterance ITEM."
@@ -738,7 +782,7 @@ FORMAT defaults to \"%s %i/%n\"."
                      'error 'done))
          (elapsed (utter--elapsed)))
     (setf (utter-item-status item) status
-          (utter--queue-current q) nil)
+          (utter--qstate-current q) nil)
     (utter--highlight-delete)
     (when (eq status 'done)
       (message "utter: finished %s (%s)" (utter-item-source-name item)
@@ -768,13 +812,13 @@ FORMAT defaults to \"%s %i/%n\"."
       (process-put proc 'utter-player player)
       (process-put proc 'utter-segment seg)
       (setf (utter--segment-status seg) 'playing
-            (utter--queue-process q) proc
-            (utter--queue-seg-start q) (float-time)
-            (utter--queue-pause-start q) nil
-            (utter--queue-paused-total q) 0)
-      (unless (eq (utter--queue-announced q) item)
-        (setf (utter--queue-announced q) item)
-        (let ((n (length (utter--queue-run q))))
+            (utter--qstate-process q) proc
+            (utter--qstate-seg-start q) (float-time)
+            (utter--qstate-pause-start q) nil
+            (utter--qstate-paused-total q) 0)
+      (unless (eq (utter--qstate-announced q) item)
+        (setf (utter--qstate-announced q) item)
+        (let ((n (length (utter--qstate-run q))))
           (message "utter: playing %s%s" (utter-item-source-name item)
                    (if (> n 1) (format " (%d/%d)" (utter--run-index item) n) ""))))
       (run-hook-with-args 'utter-progress-functions item
@@ -789,11 +833,11 @@ FORMAT defaults to \"%s %i/%n\"."
   "Advance the queue when the player PROC exits."
   (when (and (memq (process-status proc) '(exit signal))
              (not (process-get proc 'utter-stopped))
-             (eq proc (utter--queue-process utter--queue)))
+             (eq proc (utter--qstate-process utter--queue)))
     (let ((seg (process-get proc 'utter-segment))
-          (item (utter--queue-current utter--queue)))
+          (item (utter--qstate-current utter--queue)))
       (utter--account-segment)
-      (setf (utter--queue-process utter--queue) nil
+      (setf (utter--qstate-process utter--queue) nil
             (utter--segment-status seg) 'done)
       (when (and (eq (process-status proc) 'exit)
                  (/= (process-exit-status proc) 0)
@@ -808,13 +852,13 @@ FORMAT defaults to \"%s %i/%n\"."
 (defun utter--kill-player ()
   "Stop the player without advancing the queue."
   (let ((q utter--queue))
-    (when-let* ((proc (utter--queue-process q)))
+    (when-let* ((proc (utter--qstate-process q)))
       (process-put proc 'utter-stopped t)
       (let ((seg (process-get proc 'utter-segment)))
         (when (and seg (eq (utter--segment-status seg) 'playing))
           (setf (utter--segment-status seg) 'ready)))
       (utter--account-segment)
-      (setf (utter--queue-process q) nil)
+      (setf (utter--qstate-process q) nil)
       (ignore-errors
         (funcall (or (utter-player-stop (process-get proc 'utter-player))
                      #'delete-process)
@@ -823,11 +867,11 @@ FORMAT defaults to \"%s %i/%n\"."
 (defun utter--go-idle ()
   "Enter the idle state."
   (let ((q utter--queue))
-    (setf (utter--queue-paused q) nil
-          (utter--queue-run q) nil
-          (utter--queue-announced q) nil)
-    (when (utter--queue-active q)
-      (setf (utter--queue-active q) nil)
+    (setf (utter--qstate-paused q) nil
+          (utter--qstate-run q) nil
+          (utter--qstate-announced q) nil)
+    (when (utter--qstate-active q)
+      (setf (utter--qstate-active q) nil)
       (utter--highlight-delete)
       (run-hooks 'utter-queue-finished-hook))))
 
@@ -836,16 +880,16 @@ FORMAT defaults to \"%s %i/%n\"."
   (let ((q utter--queue) (again t))
     (while again
       (setq again nil)
-      (let ((item (utter--queue-current q)))
+      (let ((item (utter--qstate-current q)))
         (unless item
-          (when (setq item (cl-find 'pending (utter--queue-items q)
+          (when (setq item (cl-find 'pending (utter--qstate-items q)
                                     :key #'utter-item-status))
             (utter--start-item item)))
         (cond
          ((null item) (utter--go-idle))
-         ((utter--queue-process q))
+         ((utter--qstate-process q))
          (t
-          (setf (utter--queue-active q) t)
+          (setf (utter--qstate-active q) t)
           (let ((seg (nth (utter--item-position item) (utter--item-segments item))))
             (pcase (and seg (utter--segment-status seg))
               ('nil (utter--finish-item item) (setq again t))
@@ -855,7 +899,7 @@ FORMAT defaults to \"%s %i/%n\"."
                       (setf (utter--segment-status seg) 'done)
                       (cl-incf (utter--item-position item))
                       (setq again t))
-                     ((utter--queue-paused q))
+                     ((utter--qstate-paused q))
                      ((not (utter--play-segment item seg))
                       (setq again t))))))))))))
 
@@ -893,10 +937,10 @@ FORMAT defaults to \"%s %i/%n\"."
 (defun utter--interrupt-item (item)
   "Mark ITEM interrupted and abort its requests."
   (let ((q utter--queue))
-    (when (eq item (utter--queue-current q))
+    (when (eq item (utter--qstate-current q))
       (utter--kill-player)
       (utter--highlight-delete)
-      (setf (utter--queue-current q) nil)))
+      (setf (utter--qstate-current q) nil)))
   (utter--abort-item item)
   (setf (utter-item-status item) 'interrupted)
   (run-hook-with-args 'utter-item-finished-functions item 'interrupted))
@@ -904,23 +948,23 @@ FORMAT defaults to \"%s %i/%n\"."
 (defun utter--interrupt-all ()
   "Interrupt the current and every pending utterance."
   (let ((q utter--queue))
-    (when-let* ((cur (utter--queue-current q)))
+    (when-let* ((cur (utter--qstate-current q)))
       (utter--interrupt-item cur))
-    (dolist (item (utter--queue-items q))
+    (dolist (item (utter--qstate-items q))
       (when (eq (utter-item-status item) 'pending)
         (utter--interrupt-item item)))
-    (setf (utter--queue-paused q) nil)))
+    (setf (utter--qstate-paused q) nil)))
 
 (defun utter--reset ()
   "Throw away the queue: stop playback, requests and timers."
   (let ((q utter--queue))
     (utter--kill-player)
-    (mapc #'cancel-timer (utter--queue-timers q))
-    (dolist (item (utter--queue-items q))
+    (mapc #'cancel-timer (utter--qstate-timers q))
+    (dolist (item (utter--qstate-items q))
       (utter--abort-item item)
       (utter--highlight-drop item)))
   (utter--highlight-delete)
-  (setq utter--queue (utter--make-queue))
+  (setq utter--queue (utter--make-qstate))
   (utter--update-lighter))
 
 ;;;; Entry points
@@ -937,9 +981,10 @@ later changes do not affect this utterance.  Return the new
   (let* ((item (utter--build-item text params))
          (q utter--queue)
          (speed (plist-get (utter-item-params item) :speed)))
-    (setf (utter--queue-items q) (append (utter--queue-items q) (list item)))
+    (utter--prune-cache)
+    (setf (utter--qstate-items q) (append (utter--qstate-items q) (list item)))
     (when (utter-active-p)
-      (setf (utter--queue-run q) (append (utter--queue-run q) (list item))))
+      (setf (utter--qstate-run q) (append (utter--qstate-run q) (list item))))
     (run-hook-with-args 'utter-enqueue-hook item)
     (message "utter: queued %d chars (~%d s) from %s"
              (length (utter-item-text item))
@@ -957,8 +1002,8 @@ stay listed and can be replayed.  PARAMS are as for
   (let ((item (utter--build-item text params))
         (q utter--queue))
     (utter--interrupt-all)
-    (setf (utter--queue-items q) (append (utter--queue-items q) (list item))
-          (utter--queue-run q) (list item))
+    (setf (utter--qstate-items q) (append (utter--qstate-items q) (list item))
+          (utter--qstate-run q) (list item))
     (run-hook-with-args 'utter-enqueue-hook item)
     (utter--schedule)
     item))
@@ -975,13 +1020,13 @@ stay listed and can be replayed.  PARAMS are as for
   (interactive)
   (utter--require-active)
   (let ((q utter--queue))
-    (unless (utter--queue-paused q)
-      (setf (utter--queue-paused q) t)
-      (when-let* ((proc (utter--queue-process q)))
+    (unless (utter--qstate-paused q)
+      (setf (utter--qstate-paused q) t)
+      (when-let* ((proc (utter--qstate-process q)))
         (process-put proc 'utter-was-paused t)
         (funcall (utter-player-pause (process-get proc 'utter-player)) proc)
-        (setf (utter--queue-pause-start q) (float-time)))
-      (setf (utter-item-status (utter--queue-current q)) 'paused)
+        (setf (utter--qstate-pause-start q) (float-time)))
+      (setf (utter-item-status (utter--qstate-current q)) 'paused)
       (message "utter: paused")
       (utter--changed))))
 
@@ -991,15 +1036,15 @@ stay listed and can be replayed.  PARAMS are as for
   (interactive)
   (utter--require-active)
   (let ((q utter--queue))
-    (when (utter--queue-paused q)
-      (setf (utter--queue-paused q) nil)
-      (when-let* ((proc (utter--queue-process q)))
+    (when (utter--qstate-paused q)
+      (setf (utter--qstate-paused q) nil)
+      (when-let* ((proc (utter--qstate-process q)))
         (funcall (utter-player-resume (process-get proc 'utter-player)) proc)
-        (when (utter--queue-pause-start q)
-          (cl-incf (utter--queue-paused-total q)
-                   (- (float-time) (utter--queue-pause-start q))))
-        (setf (utter--queue-pause-start q) nil))
-      (setf (utter-item-status (utter--queue-current q)) 'playing)
+        (when (utter--qstate-pause-start q)
+          (cl-incf (utter--qstate-paused-total q)
+                   (- (float-time) (utter--qstate-pause-start q))))
+        (setf (utter--qstate-pause-start q) nil))
+      (setf (utter-item-status (utter--qstate-current q)) 'playing)
       (message "utter: resumed")
       (utter--schedule))))
 
@@ -1007,7 +1052,7 @@ stay listed and can be replayed.  PARAMS are as for
 (defun utter-toggle-pause ()
   "Pause or resume playback."
   (interactive)
-  (if (utter--queue-paused utter--queue) (utter-resume) (utter-pause)))
+  (if (utter--qstate-paused utter--queue) (utter-resume) (utter-pause)))
 
 ;;;###autoload (autoload 'utter-next "utter" nil t)
 (defun utter-next (&optional n)
@@ -1017,11 +1062,11 @@ Skipped utterances are marked `interrupted'."
   (utter--require-active)
   (let ((q utter--queue))
     (dotimes (_ (max 1 (or n 1)))
-      (when-let* ((item (or (utter--queue-current q)
-                            (cl-find 'pending (utter--queue-items q)
+      (when-let* ((item (or (utter--qstate-current q)
+                            (cl-find 'pending (utter--qstate-items q)
                                      :key #'utter-item-status))))
         (utter--interrupt-item item)))
-    (setf (utter--queue-paused q) nil)
+    (setf (utter--qstate-paused q) nil)
     (utter--schedule)))
 
 ;;;###autoload (autoload 'utter-previous "utter" nil t)
@@ -1030,8 +1075,8 @@ Skipped utterances are marked `interrupted'."
 At the first utterance, restart it.  When idle, replay the last."
   (interactive "p")
   (let* ((q utter--queue)
-         (items (utter--queue-items q))
-         (cur (utter--queue-current q))
+         (items (utter--qstate-items q))
+         (cur (utter--qstate-current q))
          (idx (if cur (cl-position cur items) (length items)))
          (target (and items (nth (max 0 (- idx (max 1 (or n 1)))) items))))
     (unless target (user-error "No previous utterance"))
@@ -1040,16 +1085,16 @@ At the first utterance, restart it.  When idle, replay the last."
 (defun utter--restart-from (target)
   "Play TARGET from its start, then what follows it in the queue."
   (let* ((q utter--queue)
-         (cur (utter--queue-current q)))
+         (cur (utter--qstate-current q)))
     (when cur
       (utter--kill-player)
       (utter--highlight-delete)
-      (setf (utter--queue-current q) nil)
+      (setf (utter--qstate-current q) nil)
       (utter--reset-item cur))
     (utter--reset-item target)
-    (unless (memq target (utter--queue-run q))
-      (setf (utter--queue-run q) (cons target (utter--queue-run q))))
-    (setf (utter--queue-paused q) nil)
+    (unless (memq target (utter--qstate-run q))
+      (setf (utter--qstate-run q) (cons target (utter--qstate-run q))))
+    (setf (utter--qstate-paused q) nil)
     (utter--schedule)))
 
 ;;;###autoload (autoload 'utter-stop "utter" nil t)
@@ -1065,21 +1110,15 @@ At the first utterance, restart it.  When idle, replay the last."
 With prefix ARG, also drop finished ones."
   (interactive "P")
   (let* ((q utter--queue)
-         (cur (utter--queue-current q))
+         (cur (utter--qstate-current q))
          (drop (cl-remove-if-not
                 (lambda (item)
                   (and (not (eq item cur))
                        (or (eq (utter-item-status item) 'pending)
                            (and arg (memq (utter-item-status item)
                                           '(done error interrupted))))))
-                (utter--queue-items q))))
-    (dolist (item drop)
-      (utter--abort-item item)
-      (utter--highlight-drop item))
-    (setf (utter--queue-items q) (cl-remove-if (lambda (i) (memq i drop))
-                                               (utter--queue-items q))
-          (utter--queue-run q) (cl-remove-if (lambda (i) (memq i drop))
-                                             (utter--queue-run q)))
+                (utter--qstate-items q))))
+    (utter--drop-items drop)
     (message "utter: cleared %d utterance%s" (length drop)
              (if (= (length drop) 1) "" "s"))
     (utter--schedule)))
@@ -1107,7 +1146,7 @@ With prefix ARG, also drop finished ones."
   "Return the most recent finished or interrupted utterance."
   (or (cl-find-if (lambda (item)
                     (memq (utter-item-status item) '(done error interrupted)))
-                  (reverse (utter--queue-items utter--queue)))
+                  (reverse (utter--qstate-items utter--queue)))
       (user-error "Nothing to replay")))
 
 ;;;###autoload (autoload 'utter-replay-item "utter" nil t)
@@ -1116,14 +1155,14 @@ With prefix ARG, also drop finished ones."
 Interactively, replay the most recent finished utterance."
   (interactive (list (utter--last-finished-item)))
   (let ((q utter--queue))
-    (if (eq item (utter--queue-current q))
+    (if (eq item (utter--qstate-current q))
         (utter--restart-from item)
       (utter--reset-item item)
-      (setf (utter--queue-items q)
-            (append (delq item (utter--queue-items q)) (list item)))
+      (setf (utter--qstate-items q)
+            (append (delq item (utter--qstate-items q)) (list item)))
       (when (utter-active-p)
-        (setf (utter--queue-run q)
-              (append (delq item (utter--queue-run q)) (list item))))
+        (setf (utter--qstate-run q)
+              (append (delq item (utter--qstate-run q)) (list item))))
       (utter--schedule))))
 
 (provide 'utter-queue)

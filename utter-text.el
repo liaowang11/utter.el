@@ -25,11 +25,9 @@
 
 (require 'cl-lib)
 (require 'subr-x)
-
-(defgroup utter nil
-  "Read text aloud through text-to-speech backends."
-  :group 'multimedia
-  :prefix "utter-")
+;; For the `utter' customization group.  Soft while utter-core.el is
+;; written in parallel.
+(require 'utter-core nil t)
 
 ;;;; Preprocessing
 

@@ -187,6 +187,14 @@
   (should (= (utter--text-measure "a😀" 'bytes) 5))
   (should (= (utter--text-measure "a😀" 'chars) 2)))
 
+(ert-deftest utter-text-measure-matches-core ()
+  ;; The core checks sizes with `utter--text-length'; segments must
+  ;; agree with it or `utter-request' would refuse them.
+  (skip-unless (fboundp 'utter--text-length))
+  (dolist (s '("plain" "你好，世界" "emoji 😀 and ü" ""))
+    (dolist (unit '(chars bytes utf16))
+      (should (= (utter--text-measure s unit) (utter--text-length s unit))))))
+
 (ert-deftest utter-text-split-never-inside-ssml-tags ()
   (let* ((utter--first-segment-chars 1000)
          (text (concat "<speak>"

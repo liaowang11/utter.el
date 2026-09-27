@@ -39,15 +39,11 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
                     (utter-instructions . nil) (utter-highlight . nil)
                     (utter-highlight-follow . nil) (utter-lighter . " ♪%i/%n")
                     (utter-prefetch-depth . 2) (utter-max-concurrent-requests . 2)
-                    (utter-cache-max-size . ,(* 500 1024 1024))
-                    (utter-voice-cache-ttl . 86400) (utter-player . auto)
-                    (utter-curl-program . "curl") (utter-proxy . "")
-                    (utter-log-level . nil)
+                    (utter-player . auto)
                     (utter-thing-at-point-functions . (utter--gptel-response-at-point))
                     (utter-expert-commands . nil)))
       (should (custom-variable-p (car pair)))
       (should (equal (std (car pair)) (cdr pair))))
-    (should (string-suffix-p "utter" (std 'utter-cache-directory)))
     (unless (eq system-type 'darwin)
       (should-not (std 'utter-backend)))))
 
@@ -167,40 +163,40 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
                      '(utter-enqueue "Killed text." (:source-name "kill ring")))))))
 
 (ert-deftest utter-speak-end-to-end-with-fake-core ()
-  (utter-test-with-queue ()
+  (utter-eng-with-queue ()
     (with-temp-buffer
       (insert "Spoken for real.")
       (goto-char 3)
       (utter-speak)
-      (should (utter-test--wait #'utter-test--idle-p))
-      (should (equal (utter-test--texts) '("Spoken for real.")))
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (equal (utter-eng--texts) '("Spoken for real.")))
       (should (member (format "utter: finished %s (0:00)" (buffer-name))
-                      utter-test--messages)))))
+                      utter-eng--messages)))))
 
 (ert-deftest utter-save-to-file-single-request ()
-  (utter-test-with-queue ((utter-test--auto nil))
+  (utter-eng-with-queue ((utter-eng--auto nil))
     (let ((file (make-temp-file "utter-save" nil ".wav")))
       (utter-save-to-file "Save me." file)
-      (let ((args (utter-test-req-args (car utter-test--requests))))
-        (should (equal (utter-test-req-text (car utter-test--requests)) "Save me."))
+      (let ((args (utter-eng-req-args (car utter-eng--requests))))
+        (should (equal (utter-eng-req-text (car utter-eng--requests)) "Save me."))
         (should (equal (plist-get args :file) file))
         (should (eq (plist-get args :format) 'wav)))
-      (utter-test--respond 0)
-      (should (member (format "utter: saved %s" file) utter-test--messages))
+      (utter-eng--respond 0)
+      (should (member (format "utter: saved %s" file) utter-eng--messages))
       (delete-file file))))
 
 (ert-deftest utter-save-to-file-refuses-several-requests ()
-  (utter-test-with-queue ((utter-backend (utter-test--backend :max-chars 20))
+  (utter-eng-with-queue ((utter-backend (utter-eng--backend :max-chars 20))
                           (utter--first-segment-chars 20))
-    (let ((err (should-error (utter-save-to-file (utter-test--three-sentences)
+    (let ((err (should-error (utter-save-to-file (utter-eng--three-sentences)
                                                  "/tmp/x.wav")
                              :type 'user-error)))
       (should (string-match-p "ffmpeg" (cadr err)))
       (should-not (string-match-p "chunk" (cadr err))))
-    (should-not utter-test--requests)))
+    (should-not utter-eng--requests)))
 
 (ert-deftest utter-inspect-query-shows-dry-run ()
-  (utter-test-with-queue ((dry nil))
+  (utter-eng-with-queue ((dry nil))
     (cl-letf (((symbol-function 'utter-request)
                (lambda (text &rest args)
                  (setq dry (plist-get args :dry-run))
@@ -219,7 +215,7 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
       (kill-buffer "*utter-inspect*"))))
 
 (ert-deftest utter-select-voice-sets-with-scope ()
-  (utter-test-with-queue ()
+  (utter-eng-with-queue ()
     (cl-letf (((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
                  (should (member "v2" (all-completions "" collection)))
@@ -233,12 +229,20 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
 (ert-deftest utter-log-buffer ()
   (save-window-excursion
     (utter-log)
-    (should (equal (buffer-name) "*utter-log*"))))
+    (should (equal (buffer-name) utter--log-buffer-name))))
+
+(ert-deftest utter-text-at-point-for-the-menu ()
+  (with-temp-buffer
+    (insert "One here.  Two there.")
+    (goto-char 14)
+    (should (equal (utter--text-at-point) (cons "Two there." (buffer-name))))
+    (erase-buffer)
+    (should-error (utter--text-at-point) :type 'user-error)))
 
 ;;;; Scope
 
 (ert-deftest utter-scope-global-buffer-local-and-oneshot ()
-  (utter-test-with-queue ((utter-voice "base"))
+  (utter-eng-with-queue ((utter-voice "base"))
     (with-temp-buffer
       (utter--set-with-scope 'utter-voice "local" t)
       (should (local-variable-p 'utter-voice))
@@ -251,7 +255,7 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
     (should (equal utter-voice "once"))
     (let ((item (utter-enqueue "First.")))
       (should (equal (plist-get (utter-item-params item) :voice) "once")))
-    (should (utter-test--wait (lambda () (equal utter-voice "global")) 1))
+    (should (utter-eng--wait (lambda () (equal utter-voice "global")) 1))
     (let ((item (utter-enqueue "Second.")))
       (should (equal (plist-get (utter-item-params item) :voice) "global")))
     (should-not utter-enqueue-hook)))
@@ -259,7 +263,7 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
 ;;;; Presets
 
 (ert-deftest utter-presets-apply-and-let-bind ()
-  (utter-test-with-queue ((utter--known-presets nil) (order nil))
+  (utter-eng-with-queue ((utter--known-presets nil) (order nil))
     (utter-make-preset 'base :description "Base" :voice "v1" :speed 0.9)
     (utter-make-preset 'fast
       :description "Fast English"
@@ -283,8 +287,8 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
       (should (eq utter--preset 'fast)))))
 
 (ert-deftest utter-preset-backend-by-name-and-setter ()
-  (utter-test-with-queue ((utter--known-presets nil) (set nil))
-    (let ((other (utter-test--backend :name "Other")))
+  (utter-eng-with-queue ((utter--known-presets nil) (set nil))
+    (let ((other (utter-eng--backend :name "Other")))
       (cl-letf (((symbol-function 'utter-get-backend)
                  (lambda (name) (and (equal name "Other") other))))
         (utter--apply-preset '(:backend "Other" :voice "v2")

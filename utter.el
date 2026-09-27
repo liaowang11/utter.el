@@ -45,7 +45,9 @@
 (require 'subr-x)
 (require 'utter-queue)
 
-(declare-function utter-menu "utter-transient" ())
+(autoload 'utter-menu "utter-transient" nil t)
+(autoload 'utter-queue "utter-mode" nil t)
+(defvar utter--log-buffer-name)
 (declare-function utter-say-register-default "utter-say" ())
 (declare-function utter-request "utter-core" (text &rest keys))
 (declare-function utter-get-backend "utter-core" (name))
@@ -55,6 +57,8 @@
 (declare-function utter-backend-formats "utter-core" (backend))
 (declare-function utter-backend-max-chars "utter-core" (backend))
 (declare-function utter-backend-max-chars-unit "utter-core" (backend))
+(declare-function utter--resolve-backend "utter-core" (backend))
+(declare-function utter--list-voices "utter-core" (backend callback))
 
 ;;;; Options
 
@@ -145,44 +149,12 @@ dropped when only one utterance is queued."
   :type 'natnum
   :group 'utter)
 
-(defcustom utter-cache-directory
-  (expand-file-name "utter" (or (getenv "XDG_CACHE_HOME") "~/.cache"))
-  "Directory for synthesized audio."
-  :type 'directory
-  :group 'utter)
-
-(defcustom utter-cache-max-size (* 500 1024 1024)
-  "Maximum size of `utter-cache-directory' in bytes, or nil for no limit.
-The least recently used files are removed first."
-  :type '(choice (const :tag "Unlimited" nil) natnum)
-  :group 'utter)
-
-(defcustom utter-voice-cache-ttl 86400
-  "Seconds a fetched voice list stays valid."
-  :type 'natnum
-  :group 'utter)
-
 (defcustom utter-player 'auto
   "The audio player: an `utter-player', a symbol naming one, or `auto'.
 `auto' picks the first installed player that plays the audio format,
 from `utter-player-afplay' (macOS), `utter-player-ffplay' and
 `utter-player-mpv'."
   :type '(choice (const auto) symbol sexp)
-  :group 'utter)
-
-(defcustom utter-curl-program "curl"
-  "The curl program used for requests."
-  :type 'string
-  :group 'utter)
-
-(defcustom utter-proxy ""
-  "Proxy for requests, as accepted by curl's --proxy; empty for none."
-  :type 'string
-  :group 'utter)
-
-(defcustom utter-log-level nil
-  "What to write to the *utter-log* buffer: nil, `info' or `debug'."
-  :type '(choice (const :tag "Nothing" nil) (const info) (const debug))
   :group 'utter)
 
 (defcustom utter-thing-at-point-functions '(utter--gptel-response-at-point)
@@ -234,18 +206,23 @@ The region if active, else the first claim of
          (string-match-p "[^ \t\n]" (buffer-substring-no-properties (car b) (cdr b)))
          b)))
 
+(defun utter--text-at-point (&optional _arg)
+  "Return (TEXT . SOURCE-NAME) for what `utter-speak' reads.
+TEXT is the region, else the first claim of
+`utter-thing-at-point-functions', else the sentence at point.
+When `utter-highlight' is on, TEXT carries position tags.  Signal
+a `user-error' when there is nothing to read."
+  (let ((b (or (utter--text-bounds) (user-error "Nothing to read here"))))
+    (cons (utter--buffer-text (car b) (cdr b)) (buffer-name))))
+
 (defun utter--speak-at-point (function)
   "Pass the text at point to FUNCTION, `utter-enqueue' or `utter-interrupt'."
-  (let ((b (or (utter--text-bounds) (user-error "Nothing to read here"))))
-    (funcall function (utter--buffer-text (car b) (cdr b))
-             :source-buffer (current-buffer))))
+  (funcall function (car (utter--text-at-point))
+           :source-buffer (current-buffer)))
 
 (defun utter--open-menu ()
-  "Open `utter-menu', loading it if needed."
-  (unless (fboundp 'utter-menu) (require 'utter-transient nil t))
-  (if (fboundp 'utter-menu)
-      (call-interactively 'utter-menu)
-    (user-error "The utter menu (utter-transient) is not available")))
+  "Open `utter-menu'."
+  (call-interactively #'utter-menu))
 
 ;;;; Commands
 
@@ -303,8 +280,7 @@ new `utter-item'."
 
 (defun utter--text-for-command ()
   "Return the text `utter-speak' would read, as a plain string."
-  (let ((b (or (utter--text-bounds) (user-error "Nothing to read here"))))
-    (buffer-substring-no-properties (car b) (cdr b))))
+  (substring-no-properties (car (utter--text-at-point))))
 
 (defun utter--single-segment (text params)
   "Return TEXT preprocessed for resolved PARAMS as one request-sized string.
@@ -331,7 +307,7 @@ Only text that fits one request can be saved for now."
      (list text (read-file-name "Save audio to: "))))
   (let* ((file (expand-file-name file))
          (ext (utter--format-symbol (file-name-extension file)))
-         (params (utter--resolve-params
+         (params (utter--snapshot-params
                   (and ext (memq ext (utter-backend-formats
                                       (utter--resolve-backend utter-backend)))
                        (list :format ext))
@@ -352,7 +328,7 @@ Only text that fits one request can be saved for now."
 The dry run goes to the *utter-inspect* buffer; secrets are redacted."
   (interactive)
   (let* ((text (utter--text-for-command))
-         (params (utter--resolve-params nil text))
+         (params (utter--snapshot-params nil text))
          (pieces (utter--split (utter--preprocess text (current-buffer))
                                (or (utter-backend-max-chars (plist-get params :backend))
                                    utter--default-max-chars)
@@ -373,13 +349,17 @@ The dry run goes to the *utter-inspect* buffer; secrets are redacted."
 (defun utter--voice-candidates (backend)
   "Return the voices of BACKEND as a list of (NAME . DESCRIPTION)."
   (let ((voices (utter-backend-voices backend)))
-    (when (and (null voices) (fboundp 'utter--list-voices))
-      (let ((done nil) (deadline (+ (float-time) 5)))
-        (ignore-errors
-          (funcall 'utter--list-voices backend
-                   (lambda (result &rest _) (setq voices result done t))))
-        (while (and (not done) (< (float-time) deadline))
-          (accept-process-output nil 0.05))))
+    (unless (consp voices)
+      (setq voices nil)
+      (when (fboundp 'utter--list-voices)
+        ;; Static lists answer at once; fetched ones are cached by core.
+        (let ((done nil) (deadline (+ (float-time) 5)))
+          (with-demoted-errors "utter: cannot list voices: %S"
+            (utter--list-voices backend
+                                (lambda (result &rest _)
+                                  (setq voices result done t))))
+          (while (and (not done) (< (float-time) deadline))
+            (accept-process-output nil 0.05)))))
     (mapcar (lambda (v)
               (cond ((consp v)
                      (cons (format "%s" (car v))
@@ -415,7 +395,8 @@ The dry run goes to the *utter-inspect* buffer; secrets are redacted."
 (defun utter-log ()
   "Show the *utter-log* buffer."
   (interactive)
-  (pop-to-buffer (get-buffer-create "*utter-log*")))
+  (pop-to-buffer (get-buffer-create (or (bound-and-true-p utter--log-buffer-name)
+                                       "*utter-log*"))))
 
 ;;;; Setting options with scope
 
