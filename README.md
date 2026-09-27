@@ -2,8 +2,8 @@
 
 Read text aloud in Emacs through many text-to-speech backends: macOS
 `say`, any OpenAI-compatible `/v1/audio/speech` server (OpenAI,
-OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI, ...) and ElevenLabs. One
-transient menu drives everything.
+OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI, ...), ElevenLabs, Gemini and
+xAI. One transient menu drives everything.
 
 **Status: work in progress.** The API is being built against the
 contract in [DESIGN.md](DESIGN.md); names there are authoritative where
@@ -76,8 +76,12 @@ backend; define one.
     :formats '(mp3 wav)
     :request-params '(:stream :false))
 
-  ;; ElevenLabs.  Voices are fetched from the API when you pick one.
+  ;; ElevenLabs and xAI.  Voices are fetched from the API when you pick one.
   (utter-make-elevenlabs "ElevenLabs")
+  (utter-make-xai "xAI")
+
+  ;; Gemini `/v1beta/interactions'.
+  (utter-make-gemini "Gemini")
 
   ;; A named bundle of settings, selectable with @ in the menu.
   (utter-make-preset 'zh-narrator
@@ -97,6 +101,8 @@ same entry gptel uses. In `~/.authinfo.gpg`:
 ```
 machine api.openai.com login apikey password sk-...
 machine api.elevenlabs.io login apikey password ...
+machine generativelanguage.googleapis.com login apikey password ...
+machine api.x.ai login apikey password ...
 ```
 
 `:key` also accepts a string, a variable symbol, or a function. Keys
@@ -153,7 +159,8 @@ status 200, and non-audio bytes are reported instead of played.
 | macOS `say` | `utter-make-say` | MVP |
 | OpenAI `/v1/audio/speech` and compatibles: OpenAI, OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI, speaches | `utter-make-openai` | MVP |
 | ElevenLabs | `utter-make-elevenlabs` | MVP |
-| Gemini (`/v1beta/interactions`) | | Optional, after MVP |
+| Gemini (`/v1beta/interactions`) | `utter-make-gemini` | Done, verified against the real API |
+| xAI (`/v1/tts`, grok-tts) | `utter-make-xai` | Done, verified against the real API |
 | Azure, Amazon Polly, Cartesia, Deepgram, Fish Audio, Piper, MiniMax, DashScope Qwen TTS, Volcengine, Hume, Inworld | | Planned |
 
 ## Development

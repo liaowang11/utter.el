@@ -42,6 +42,7 @@ body predates the corrections applied here).
 | `utter-openai.el` | CORE | OpenAI-compatible `/v1/audio/speech` backend (OpenAI, OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI…) | core |
 | `utter-elevenlabs.el` | CORE | ElevenLabs backend (bytes; voices fetched) | core |
 | `utter-gemini.el` | CORE, optional | Gemini `/v1beta/interactions` (b64-json WAV) | core |
+| `utter-xai.el` | CORE, optional | xAI `/v1/tts` grok-tts (bytes mp3/wav; voices fetched from `/v1/tts/voices`) | core |
 | `utter-text.el` | ENGINE | preprocessing, sentence splitting into segments (private) | core (for `max-chars`) |
 | `utter-queue.el` | ENGINE | item/segment/queue structs, player struct, prefetch, `utter-state`, lighter, highlight | core, text |
 | `utter.el` | ENGINE | package main file: defcustoms, `utter-speak*` commands, `utter-enqueue`/`utter-interrupt` entry points, presets, scope, thing-at-point | queue |
@@ -387,6 +388,11 @@ Real-server checks (2026-09-27, batch Emacs, keys from `pass`):
   auth-source-pass resolves by default): 200, base64 WAV decoded, 5.8 s
   played. Body shape `input[user_input] / response_format audio /
   generation_config.speech_config[voice]` accepted as sent.
+- xAI `/v1/tts` with the key from `pass` (`api.x.ai/apikey`): `output_format`
+  must be the struct `{"codec": "mp3"|"wav"}` (422 text/plain otherwise);
+  200 audio/mpeg and audio/wav decoded and played (English mp3 3.9 s, Chinese
+  wav 2.7 s with `language` auto-detected as zh); `GET /v1/tts/voices` listed
+  28 voices.
 - Menu opened against the real engine in batch; `utter--suffix-speak nil`
   spoke the sentence at point; heading rendered live state; three-utterance
   run exercised prefetch, pause/resume (SIGSTOP), `utter-next`, lighter
