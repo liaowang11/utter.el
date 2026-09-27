@@ -894,6 +894,11 @@ Runs `utter--request-data', merges `request-params' and applies
           (setq info (plist-put info :duration (utter--wav-duration audio)))))
       (setf (utter-request-info req) info)
       (dolist (f (plist-get info :temp-files)) (ignore-errors (delete-file f)))
+      ;; A failed or aborted request must not leave a partial file where
+      ;; a later cache lookup would find it.
+      (when-let* (((not (stringp audio)))
+                  (partial (plist-get info :partial-file)))
+        (ignore-errors (delete-file partial)))
       (utter--log 'info "%s %s%s" (utter-backend-name (plist-get info :backend))
                   (utter-request-status req) (if error (concat ": " error) ""))
       (let ((utter-request-info info))
@@ -980,6 +985,7 @@ Signals `utter-text-too-long' instead of splitting."
                         (copy-file audio-file (utter-cache-file key fmt) t)))
                     (utter--finish req audio-file)))))
           (setq info (plist-put info :file out))
+          (unless file (setq info (plist-put info :partial-file out)))
           (setf (utter-request-info req) info)
           (let ((utter-request-info info))
             (run-hooks 'utter-pre-request-hook))

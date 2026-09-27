@@ -131,6 +131,19 @@ its arguments in ARGS-FILE and prints the voice list for -v ?."
         (should-not (car res))
         (should (string-match-p "Voice not found" (plist-get (cadr res) :error)))))))
 
+(ert-deftest utter-say-test-failure-leaves-no-cache-file ()
+  (utter-test-with-temp-dir dir
+    (let* ((script (expand-file-name "say" dir))
+           (utter-cache-directory (expand-file-name "cache" dir))
+           (utter-say-program script)
+           (b (utter-make-say "Say-partial")))
+      (with-temp-file script
+        (insert "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && printf FORM > \"$2\"; shift; done\nexit 1\n"))
+      (set-file-modes script #o755)
+      (let ((res (utter-test-request "partial" :backend b)))
+        (should-not (car res))
+        (should-not (utter--cache-files))))))
+
 (ert-deftest utter-say-test-register-default ()
   (let* ((utter--known-backends nil)
          (b (utter-say-register-default)))
