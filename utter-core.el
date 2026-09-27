@@ -460,8 +460,18 @@ The config goes to curl on stdin, so secrets stay out of argv."
    "header = \"Expect:\"\n"
    (when user (format "user = %s\n" (utter--curl-quote user)))
    (when data-file (format "data-binary = %s\n" (utter--curl-quote (concat "@" data-file))))
-   (unless (string-empty-p (or utter-proxy ""))
-     (format "proxy = %s\n" (utter--curl-quote utter-proxy)))))
+   (cond
+    ((not (string-empty-p (or utter-proxy "")))
+     (format "proxy = %s\n" (utter--curl-quote utter-proxy)))
+    ;; curl applies http_proxy even to loopback; local servers never
+    ;; want it.
+    ((utter--loopback-url-p url) "noproxy = \"*\"\n"))))
+
+(defun utter--loopback-url-p (url)
+  "Return non-nil if URL points at localhost or a loopback address."
+  (string-match-p
+   "\\`[a-z]+://\\(?:[^/@]*@\\)?\\(?:localhost\\|127\\.[0-9.]+\\|\\[::1\\]\\)\\(?:[:/?#]\\|\\'\\)"
+   url))
 
 (defun utter--curl-args (backend raw-file)
   "Return the curl argv for BACKEND writing the body to RAW-FILE."

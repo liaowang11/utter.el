@@ -185,6 +185,11 @@
     (should (string-match-p "^request = \"GET\"$" cfg))
     (should (string-match-p "^user = \"ak:sk\"$" cfg))
     (should-not (string-match-p "data-binary" cfg)))
+  (should (string-match-p "^noproxy = \"\\*\"$" (utter--curl-config "http://127.0.0.1:9/x" nil nil nil)))
+  (should (string-match-p "^noproxy" (utter--curl-config "http://localhost/x" nil nil nil)))
+  (should (string-match-p "^noproxy" (utter--curl-config "http://[::1]:80/x" nil nil nil)))
+  (should-not (string-match-p "noproxy" (utter--curl-config "https://api.openai.com/x" nil nil nil)))
+  (should-not (string-match-p "noproxy" (utter--curl-config "https://localhost.example.com/x" nil nil nil)))
   (let ((utter-proxy "http://proxy:8080"))
     (should (string-match-p "^proxy = \"http://proxy:8080\"$"
                             (utter--curl-config "http://h" nil nil nil)))))
@@ -413,6 +418,18 @@ PATH is matched without the query string.")
           (should (equal (cdr (assoc "content-type" (plist-get sreq :headers)))
                          "application/json"))
           (should (equal (plist-get json :input) "你好 world")))))))
+
+(ert-deftest utter-core-test-request-ignores-env-proxy-for-loopback ()
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-server `(("/ok" 200 "audio/mpeg" ,utter-test-mp3))
+    (let* ((process-environment
+            (append '("http_proxy=http://127.0.0.1:1" "HTTP_PROXY=http://127.0.0.1:1"
+                      "all_proxy=http://127.0.0.1:1" "ALL_PROXY=http://127.0.0.1:1"
+                      "no_proxy" "NO_PROXY")
+                    process-environment))
+           (res (utter-test-request "hi" :backend (utter-test-backend host) :cache nil)))
+      (should (car res))
+      (delete-file (car res)))))
 
 (ert-deftest utter-core-test-request-no-key-no-header ()
   (skip-unless (executable-find "curl"))
