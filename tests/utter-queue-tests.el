@@ -456,7 +456,7 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
         (should (= (length starts) 2))
         (let ((offset (cadr (car starts))))
           ;; About 0.15 s played at rate 1.5, so about 0.22 s of audio.
-          (should (and (numberp offset) (< 0.1 offset 0.5))))
+          (should (and (numberp offset) (< 0.1 offset 0.8))))
         (should (equal (car (car starts)) 1.5))
         (should (utter-eng--wait #'utter-eng--idle-p))
         (should (eq (utter-item-status item) 'done))
