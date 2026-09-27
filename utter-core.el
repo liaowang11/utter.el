@@ -192,9 +192,9 @@ Return nil when nothing is known yet."
 
 (defun utter--model-valid-p (backend model)
   "Return non-nil if MODEL is nil or one of BACKEND's models.
-A backend without a model list accepts any model."
+A backend without a model list offers nothing to pick, so any
+MODEL is stale there."
   (or (null model)
-      (null (utter-backend-models backend))
       (memq model (mapcar #'utter--model-name (utter-backend-models backend)))))
 
 (defun utter--voice-valid-p (backend voice &optional model)

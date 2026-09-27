@@ -378,6 +378,11 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
     (utter--sanitize-settings)
     (should (eq utter-model 'fake-model))
     (should (equal utter-voice "v2"))
+    ;; No model list means nothing to pick, so a model there is stale.
+    (let ((utter-backend (utter-eng--backend :models nil)))
+      (setq utter-model 'fake-model)
+      (utter--sanitize-settings)
+      (should-not utter-model))
     ;; A voice list that is still to be fetched cannot be checked: keep it.
     (let ((utter-backend (utter-eng--backend :voices 'fetch)))
       (setq utter-voice "anything")
