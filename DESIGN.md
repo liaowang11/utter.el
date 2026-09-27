@@ -1,0 +1,358 @@
+# utter.el design contract
+
+Read aloud in Emacs through many text-to-speech backends, driven by one
+transient menu. This file is the contract between the modules. It
+supersedes `~/PARA/projects/emacs-tts-package/api-design.md` where they
+differ (that document still has the rationale and longer examples; its
+body predates the corrections applied here).
+
+## Rules that shaped the design (Bill, 2026-09-27)
+
+1. **The transient menu is the product.** `utter-menu` exposes every
+   parameter, input source, output target and playback control.
+   `utter-speak` is the convenience command: the menu's `RET` with default
+   arguments, the same relationship as `gptel-send` to `gptel-menu`.
+2. **Async listening.** Text is snapshotted at request time and never
+   re-read from the buffer. One global queue. Point never moves, windows
+   never recenter, no buffer pops up. The only default indicator is a short
+   lighter in `global-mode-string`. Completion and errors use `message`.
+3. **Highlight is opt-in and off by default** (`utter-highlight`). It is
+   dropped as soon as the source buffer changes after capture.
+4. **Header line and local keys exist only inside `utter-mode`**, which is
+   auto-enabled only in the queue buffer. Ordinary buffers never get either.
+5. **Chunks are internal.** The user-facing unit is the *utterance*: one
+   speak request. No user-visible string, key description, lighter, column,
+   command name or defcustom may say "chunk". Internally the text is split
+   into request-sized *segments*; that word stays in private symbols and
+   code comments only.
+6. **Append is the default.** `utter-speak` and `utter-speak-string`
+   append to the queue. Interrupting is explicit: `utter-speak-interrupt`,
+   `utter-interrupt`, or the `S` switch in the menu.
+7. **No default keybindings.** The package binds nothing globally. The only
+   keymap it owns is `utter-mode-map`, active where `utter-mode` is on.
+8. **Standalone package.** Emacs 30.1+, `cl-lib`, `transient`. No other
+   hard dependency. gptel is an optional key source, never required.
+
+## Layering and file ownership
+
+| File | Owner | Contents | Requires |
+|---|---|---|---|
+| `utter-core.el` | CORE | backend struct, generics, key lookup, curl runner, decoders, `utter-request`, `utter-fetch-json`, cache | cl-lib, auth-source, json |
+| `utter-say.el` | CORE | macOS `say` backend (`process` kind) | core |
+| `utter-openai.el` | CORE | OpenAI-compatible `/v1/audio/speech` backend (OpenAI, OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI…) | core |
+| `utter-elevenlabs.el` | CORE | ElevenLabs backend (bytes; voices fetched) | core |
+| `utter-gemini.el` | CORE, optional | Gemini `/v1beta/interactions` (b64-json WAV) | core |
+| `utter-text.el` | ENGINE | preprocessing, sentence splitting into segments (private) | core (for `max-chars`) |
+| `utter-queue.el` | ENGINE | item/segment/queue structs, player struct, prefetch, `utter-state`, lighter, highlight | core, text |
+| `utter.el` | ENGINE | package main file: defcustoms, `utter-speak*` commands, `utter-enqueue`/`utter-interrupt` entry points, presets, scope, thing-at-point | queue |
+| `utter-transient.el` | UI | `utter-menu`, infix classes, `utter--suffix-speak` | utter, transient |
+| `utter-mode.el` | UI | `utter-mode` (header line, keymap), `utter-queue-mode` and `*utter-queue*` | utter |
+| `Makefile`, `.github/`, `tests/support/`, `README.md` | ENV | build, CI, test helpers incl. a local HTTP stub server | |
+
+Dependencies point one way: backends → core ← text ← queue ← utter ←
+{transient, mode}. **The menu depends on the engine, never the reverse.**
+`utter-speak` lives in `utter.el` and calls `utter-enqueue` directly; the
+transient suffix calls the same functions with menu arguments.
+
+Ownership rules for parallel work:
+- Owners define every symbol in their files. Non-owners `require` and use
+  what this contract promises; they never add definitions to another
+  owner's file.
+- A missing or wrong symbol goes into the `HANDOFF` section of the
+  owner's report (`reports/<area>.md`), and into a test that documents the
+  expectation, not into another owner's file.
+- Tests live in `tests/<file>-tests.el`, one per source file, and must run
+  with `make test` on Linux without network, without macOS binaries, and
+  without API keys. Tests that need `say`/`afplay` use `skip-unless`.
+
+## Frozen signatures (do not change without updating this file)
+
+### Core
+
+```elisp
+(cl-defstruct (utter-backend (:constructor utter--make-backend) (:copier utter--copy-backend))
+  name host protocol endpoint url header key
+  models voices formats max-chars
+  (max-chars-unit 'chars)            ; chars | bytes | utf16
+  (response-kind 'bytes)             ; bytes | b64-json | b64-lines | hex | url | process
+  response-path                      ; for b64-json: list of keys/indices to the audio string
+  capabilities                       ; (instructions ssml timestamps stitching clone)
+  request-params curl-args body-transform
+  (coding-system 'binary))
+
+(utter-get-backend NAME)                       ; gv-setf-able registry, alist utter--known-backends
+(utter--get-api-key BACKEND)                   ; string | symbol | function -> string or nil
+(utter-api-key-from-auth-source &optional BACKEND-OR-HOST USER) ; :host H :user "apikey"
+(utter-key-from-gptel &optional NAME-OR-HOST)  ; returns a key FUNCTION; falls back to auth-source
+
+(cl-defgeneric utter--request-data (backend text params))        ; -> plist body
+(cl-defgeneric utter--normalize-params (backend params))         ; clamp/rename
+(cl-defgeneric utter--response-audio (backend info callback))    ; (CALLBACK FILE FORMAT) | (CALLBACK nil ERR)
+(cl-defgeneric utter--parse-error (backend info))                ; -> string or nil; RUNS ON EVERY RESPONSE
+(cl-defgeneric utter--list-voices (backend callback))            ; cached per name, utter-voice-cache-ttl
+(cl-defgeneric utter--start-process (backend text params file callback)) ; response-kind process
+
+(cl-defun utter-request
+    (text &key (backend utter-backend) (model utter-model) (voice utter-voice)
+          (speed utter-speed) (format utter-format) language instructions
+          context file callback dry-run (cache t))
+  "Synthesize TEXT, which must fit BACKEND's max-chars, asynchronously.
+Return an `utter-request' struct (slots: process info status).
+CALLBACK is called (AUDIO INFO): AUDIO is a file name, nil on error
+(INFO :error), or the symbol `abort'.  INFO keys: :backend :model :voice
+:speed :format :text :file :cached :http-status :error :duration :request.
+Signals `utter-text-too-long' instead of splitting.")
+(utter-abort REQUEST)
+(utter-fetch-json BACKEND METHOD PATH CALLBACK &optional BODY)
+(utter-cache-key BACKEND PARAMS TEXT)          ; sha1 of (name model voice speed format language instructions text)
+(utter-cache-lookup KEY FORMAT) (utter-cache-clear &optional OLDER-THAN-DAYS)
+```
+
+Core behaviour that is not optional:
+- **curl config on stdin**: one `-K -` config carries `header = "..."`,
+  `user = ...`, `url = ...`, `data = @file`. Keys never appear in argv.
+  Do not use `-H@-` (curl can read only one thing from stdin).
+- Body goes through a temp file (`--data-binary @file` in the config);
+  `utter-request` cleans it up.
+- Status via `-w '%{http_code}'` on stdout and `-o RAWFILE`.
+- **Every response is checked**: non-2xx ⇒ error; then
+  `utter--parse-error` runs even on 200 (MiniMax puts errors in
+  `base_resp.status_code` with HTTP 200); then the `bytes` decoder sniffs
+  the first bytes (`{`/`[` ⇒ JSON error body; `ID3`, `\xff\xfb`, `RIFF`,
+  `fLaC`, `OggS`, `FORM` ⇒ audio) before returning a file.
+- Raw PCM is wrapped in a 44-byte WAV header in the decoder, with the
+  sample rate from the backend/format, so players only ever see containers.
+- `b64-json` extracts by `response-path`; `b64-lines`, `hex`, `url` are
+  documented extension points, not MVP.
+- Dry run returns `(:url :headers :body :curl-args)` with header values
+  redacted and starts no process.
+- Retries are the queue's job, not core's. Core reports `:http-status`.
+
+Constructors (all `;;;###autoload`, `(declare (indent 1))`, register and
+return the backend):
+
+```elisp
+(utter-make-say NAME &key voices (formats '(aiff m4a)))   ; process kind; speed 1.0 = 175 wpm; text via -f tmpfile
+(utter-make-openai NAME &key (host "api.openai.com") (protocol "https") (endpoint "/v1/audio/speech")
+                   key header curl-args request-params body-transform
+                   (models '(gpt-4o-mini-tts tts-1 tts-1-hd))
+                   (voices '("alloy" "ash" "coral" "echo" "fable" "nova" "onyx" "sage" "shimmer"))
+                   (formats '(mp3 wav opus aac flac pcm)) (max-chars 4096)
+                   (capabilities '(instructions)) (instructions-key :instructions))
+(utter-make-elevenlabs NAME &key (host "api.elevenlabs.io") key curl-args request-params
+                       (models '(eleven_multilingual_v2 eleven_v3 eleven_flash_v2_5)))
+```
+
+Default `header` for cloud constructors is `Authorization: Bearer KEY`,
+omitted when the key resolves to nil (keyless local servers). Default
+`key` is auth-source by host. `request-params` is merged last into the
+body; `body-transform` (function plist→plist) runs after that, for vendors
+that rename keys (mlx-audio `instruct`). Known vendor quirks live in
+`utter-openai.el` as documented presets of keyword args, not hidden logic:
+OpenRouter needs `response_format` forced to `"mp3"`, Kokoro-FastAPI needs
+`:stream :false`.
+
+### Text (ENGINE, private except the two hooks)
+
+```elisp
+(defcustom utter-preprocess-functions
+  '(utter-strip-markup utter-replace-urls utter-collapse-whitespace utter-apply-pronunciations))
+(defcustom utter-pronunciation-alist nil)          ; ((REGEXP . REPLACEMENT) ...)
+(utter--split TEXT MAX-CHARS &optional UNIT)         ; -> list of strings; private
+(defvar utter--split-functions '(utter--split-by-sentence)) ; private abnormal hook
+(defvar utter--first-segment-chars 200)             ; private; short first segment for fast first audio
+```
+
+Splitting on `sentence-end` plus `。！？；`, packing under the limit, hard
+split at whitespace/punctuation only when one sentence exceeds the limit.
+Never split inside SSML tags. UNIT `bytes` counts UTF-8 bytes, `utf16`
+counts UTF-16 units.
+
+### Queue and player (ENGINE)
+
+```elisp
+(cl-defstruct utter-item
+  id text status                     ; pending | playing | paused | done | error | interrupted
+  params                             ; resolved plist snapshot incl. the backend object
+  source-buffer source-name markers  ; markers only when utter-highlight is on
+  tick created
+  segments (position 0))             ; PRIVATE slots: access via utter--item-segments / utter--item-position
+
+(cl-defstruct utter--segment index text status file request error duration) ; private
+
+(utter-enqueue TEXT &rest PARAMS)      ; snapshot, preprocess, split, append, start if idle; returns item
+(utter-interrupt TEXT &rest PARAMS)    ; stop player, abort requests, mark current+pending interrupted, play TEXT now
+(utter-pause) (utter-resume) (utter-toggle-pause)
+(utter-next &optional N) (utter-previous &optional N)   ; move between UTTERANCES (items), not segments
+(utter-stop) (utter-clear &optional ARG)                 ; clear drops pending items; C-u also finished ones
+(utter-rate-up) (utter-rate-down)                        ; utter-playback-rate ± 0.1, player-side, no new request
+(utter-replay-item ITEM)
+(utter-state)      ; plist (:status idle|synthesizing|playing|paused :item ITEM :index I :total N
+                   ;        :elapsed SECONDS :duration SECONDS-or-nil :pending N
+                   ;        :backend NAME :model SYM :voice STR :rate FLOAT :source NAME)
+(utter-active-p)   ; non-nil unless idle
+(utter-state-string &optional FORMAT)   ; format-spec: %s status %i index %n total %b backend %m model %v voice %r rate %t elapsed %d duration %S source
+```
+
+PARAMS accepted by `utter-enqueue` / `utter-interrupt` /
+`utter-speak-string`: the `utter-request` keys plus `:source-buffer
+:source-name`.
+
+Player:
+
+```elisp
+(cl-defstruct utter-player name formats command  ; command: (lambda (file rate) -> argv)
+  (pause #'utter-player-sigstop) (resume #'utter-player-sigcont) (stop #'delete-process))
+utter-player-afplay   ; afplay -r RATE FILE  (mp3 wav aiff m4a aac flac)
+utter-player-ffplay   ; ffplay -nodisp -autoexit -loglevel error -af atempo=RATE FILE
+utter-player-mpv      ; mpv --no-video --speed=RATE FILE
+(defcustom utter-player 'auto)   ; first installed player that plays the segment's format
+```
+
+Pause is SIGSTOP/SIGCONT (verified on afplay and ffplay). Prefetch
+`utter-prefetch-depth` (2) segments ahead across item boundaries, at most
+`utter-max-concurrent-requests` (2) curl processes. On 429/5xx retry once
+with backoff, then mark the segment `error`, `message` it, continue.
+
+Hooks (public):
+
+```elisp
+utter-pre-request-hook / utter-post-request-hook   ; per request (core)
+utter-enqueue-hook            ; (ITEM) once per utterance; oneshot scope resets here
+utter-progress-functions      ; (ITEM START END) START/END are positions in ITEM's text snapshot; fired when spoken text advances
+utter-item-finished-functions ; (ITEM STATUS)
+utter-queue-finished-hook     ; () queue went idle
+utter-error-functions         ; (ITEM ERROR-STRING) default: message
+utter-notify-function         ; nil | (lambda (title body))
+utter--segment-context-function ; private: (ITEM INDEX) -> (:previous :next) for stitching backends
+```
+
+Lighter: `utter-lighter` default `" ♪%i/%n"` where `%i/%n` counts
+utterances and collapses to `" ♪"` when there is one; `⟳` while
+synthesizing before first audio, `⏸` paused, `✗CODE` on error. Added to
+`global-mode-string` only while active; nil disables.
+
+Highlight: `utter-highlight` (nil). When on and the source is a live
+buffer, the item keeps segment markers and one overlay (face
+`utter-highlight`) follows `utter-progress-functions`. When
+`buffer-chars-modified-tick` differs from the captured tick, remove the
+overlay and markers for that item. `utter-highlight-follow` (nil) is the
+only thing that may move point or recenter.
+
+### Commands and defcustoms (ENGINE, in `utter.el`)
+
+```elisp
+(utter-speak &optional ARG)          ; region → thing at point (utter-thing-at-point-functions) → sentence at point; C-u opens utter-menu
+(utter-speak-interrupt &optional ARG); same text selection, via utter-interrupt
+(utter-speak-string STRING &rest PARAMS)   ; non-UI entry point; works from emacsclient -e
+(utter-speak-buffer &optional FROM-POINT)
+(utter-speak-kill)
+(utter-save-to-file TEXT FILE)       ; MVP: single segment only; several → user-error pointing at ffmpeg join (later)
+(utter-inspect-query)                ; dry run into *utter-inspect*
+(utter-select-voice)                 ; completing-read with annotations; sets utter-voice with scope
+(utter-log)                          ; pop to *utter-log*
+```
+
+| Defcustom | Default |
+|---|---|
+| `utter-backend` | the `say` backend on darwin (registered by `utter-say` at load), else nil → `user-error` naming `utter-make-openai` |
+| `utter-model`, `utter-voice`, `utter-format` | nil = backend's/model's first |
+| `utter-voice-alist` | nil; `((zh . "Tingting") (en . "Samantha"))` used when `utter-language` is `auto` |
+| `utter-speed` | 1.0 (synthesis; in the cache key) |
+| `utter-playback-rate` | 1.0 (player-side) |
+| `utter-language` | `auto` |
+| `utter-instructions` | nil |
+| `utter-highlight`, `utter-highlight-follow` | nil, nil |
+| `utter-lighter` | `" ♪%i/%n"` |
+| `utter-prefetch-depth`, `utter-max-concurrent-requests` | 2, 2 |
+| `utter-cache-directory` | `$XDG_CACHE_HOME/utter` or `~/.cache/utter` |
+| `utter-cache-max-size` | 500 MB, pruned by atime at enqueue |
+| `utter-voice-cache-ttl` | 86400 |
+| `utter-player` | `auto` |
+| `utter-curl-program`, `utter-proxy`, `utter-log-level` | "curl", "", nil |
+| `utter-thing-at-point-functions` | `(utter--gptel-response-at-point)` (reads the `gptel` text property; no require) |
+| `utter-expert-commands` | nil |
+
+Scope: `utter--set-scope` (nil global, t buffer-local, 1 oneshot) and
+`utter--set-with-scope (SYM VALUE &optional SCOPE)`, a copy of
+`gptel--set-with-scope`; the oneshot restore hangs on `utter-enqueue-hook`
+with a `(lambda (&rest _))`.
+
+Presets: `(utter-make-preset NAME &rest KEYS)` with `:description :parents
+:pre :post :backend :model :voice :speed :format :language :instructions`,
+other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
+`(utter--apply-preset PRESET &optional SETTER)`, `(utter-with-preset NAME
+&rest BODY)`.
+
+### UI (UI owner)
+
+`utter-menu` layout (keys are final):
+
+```
+[:description utter--menu-heading]          ; "Idle" | "Playing reading-aloud.org (2/5) · OpenAI:gpt-4o-mini-tts/nova · 1.0x"
+ ["Backend"  -m Backend:model  -v Voice  -s Speed  -f Format  -l Language  -i Instructions
+             -H Highlight spoken text  = Scope  @ Preset]
+ ["Input <"  r Region (default)  b Buffer from point  o Org subtree  e EWW / Info page  y Kill-ring  m Minibuffer  t String from Lisp]
+ ["Output >" s Speakers, append (default)  S Speakers, interrupt  f Save to file  c Cache only]
+ ["Playback" :if utter-active-p            ; every suffix :transient t
+             SPC Pause/resume  n Next utterance  p Previous utterance  +/- Rate  x Clear pending  q Stop all  Q Queue buffer]
+ [RET Speak   I Inspect (:if utter-expert-commands)]
+```
+
+- `:refresh-suffixes t`; `:incompatible` groups for input and for output
+  switches. Playback suffixes call the ENGINE commands directly.
+- `utter--suffix-speak (args)` is the single dispatch: input switch → text,
+  output switch → `utter-enqueue` / `utter-interrupt` /
+  `utter-save-to-file` / cache-only (`:cache-only t` param). It must be
+  callable non-interactively with `nil`.
+- Infix classes: `utter-lisp-variable` (display-nil, display-map, scope
+  aware), `utter-provider-variable` (compound backend+model, resets voice
+  when invalid, `(transient-setup)` to redraw), `utter-voice-variable`
+  (dependent on backend/model; async fetch on cache miss, free-form input
+  allowed). Numeric reader copied from `gptel--transient-read-number`.
+- Heading refresh while the menu is open: use `transient--refresh-transient`
+  guarded by `(and transient--prefix (eq (oref transient--prefix command) 'utter-menu))`.
+  `transient--refresh` does not exist in transient 0.13.7. Verify
+  `:refresh-suffixes` exists in the transient bundled with Emacs 30.1; if
+  not, declare a `transient` minimum in `Package-Requires`.
+- Evil: copy gptel's visual-state `:environment` fix, guarded by `fboundp`.
+- `utter-mode`: buffer-local minor mode, no lighter, sets
+  `header-line-format` to `(:eval (utter--header-line))` and restores the
+  old one on exit. `utter-mode-map`: `SPC` pause, `n`/`p` utterance,
+  `+`/`-` rate, `q` stop, `x` clear, `m` menu, `Q` queue, `RET` visit
+  source. Header line refreshes from `utter-progress-functions` and state
+  changes, no timer.
+- `utter-queue-mode` derives from `tabulated-list-mode`; buffer
+  `*utter-queue*`, one row per utterance: status glyph, #, backend:voice,
+  first words, `elapsed/duration`, source. `RET` visit source, `d` remove,
+  `r` replay, `o` visit source buffer. It enables `utter-mode`.
+
+## Decisions adopted as defaults (from api-design.md K1–K9)
+
+- `+`/`-` change the player rate, not synthesis speed.
+- Interrupted items stay listed as `interrupted`, replayable, never auto-resumed.
+- No default backend off macOS.
+- Voices are fetched only when the voice infix opens; cached one day.
+- Oneshot scope covers one utterance.
+- Highlight follows the playing text, not the synthesizing one.
+- `utter-speak` with no region reads a thing at point only when a
+  `utter-thing-at-point-functions` entry claims point; else the sentence.
+  Never the whole buffer implicitly.
+- Cache pruned at 500 MB by atime.
+- Multi-segment save-to-file is post-MVP.
+
+## Repository conventions
+
+- Emacs 30.1+, `lexical-binding: t`, SPDX `GPL-3.0-or-later`, header shape
+  as in `utter.el`.
+- `make compile` (byte-compile with `load-prefer-newer`), `make test`
+  (ERT batch), `make lint` (checkdoc + package-lint when available),
+  `make check` = compile + test.
+- TDD: write the failing test first, then the code. Commit small and
+  often with terse messages. No `Co-Authored-By` or agent trailers. Never
+  `--no-verify`.
+- Parallel work happens in git worktrees under `~/Repositories/worktrees/utter-<area>`
+  on branch `<area>`; the main session merges into `main` and deletes the
+  branches. Never commit to `main` from a worktree.
+- Each agent writes `reports/<area>.md` (what was built, how it was
+  verified, HANDOFF list, unverified items) before finishing.
