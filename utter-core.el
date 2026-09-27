@@ -685,15 +685,18 @@ SAMPLE-RATE is in Hz; CHANNELS defaults to 1 and BITS to 16."
 (defun utter--write-audio (bytes-or-file info)
   "Write audio to INFO's :file and return the resulting format.
 BYTES-OR-FILE is a unibyte string, or (:file NAME) for a file to
-move.  Raw PCM (INFO :format `pcm' without a RIFF header) is
-wrapped in a WAV header at INFO :sample-rate (default 24000)."
+move.  Raw PCM (INFO :format `pcm' without a container signature)
+is wrapped in a WAV header at INFO :sample-rate (default 24000).
+A container returned for a `pcm' request keeps its own format."
   (let* ((out (plist-get info :file))
          (format (plist-get info :format))
          (src (and (consp bytes-or-file) (plist-get bytes-or-file :file)))
-         (head (if src (utter--file-head src 4) (substring bytes-or-file 0 (min 4 (length bytes-or-file))))))
+         (head (if src (utter--file-head src 12)
+                 (substring bytes-or-file 0 (min 12 (length bytes-or-file)))))
+         (container (utter--container-magic head)))
     (make-directory (file-name-directory (expand-file-name out)) t)
     (cond
-     ((and (eq format 'pcm) (not (string-prefix-p "RIFF" head)))
+     ((and (eq format 'pcm) (not container))
       (let ((coding-system-for-write 'binary))
         (with-temp-file out
           (set-buffer-multibyte nil)
@@ -704,29 +707,47 @@ wrapped in a WAV header at INFO :sample-rate (default 24000)."
      (src (rename-file src out t))
      (t (let ((coding-system-for-write 'binary))
           (write-region bytes-or-file nil out nil 'silent))))
-    (utter--container-format format)))
+    (or (and (eq format 'pcm) container) (utter--container-format format))))
+
+(defun utter--container-magic (head)
+  "Return the audio format whose file signature starts HEAD, or nil.
+Only string signatures count, never MPEG frame sync, so raw PCM
+samples are not mistaken for a container."
+  (let ((case-fold-search nil))
+    (cond
+     ((string-prefix-p "ID3" head) 'mp3)
+     ((string-prefix-p "RIFF" head) 'wav)
+     ((string-prefix-p "fLaC" head) 'flac)
+     ((string-prefix-p "OggS" head) 'ogg)
+     ((string-prefix-p "FORM" head) 'aiff)
+     ((and (>= (length head) 8) (equal (substring head 4 8) "ftyp")) 'm4a))))
 
 (defun utter--decode-bytes (_backend info callback)
   "Decode a raw audio body described by INFO and call CALLBACK.
 The first bytes are sniffed: a JSON or HTML body is an error, known
 audio is moved to INFO :file, and unknown bytes are accepted only
-for the headerless `pcm' format."
+for the headerless `pcm' format.  For `pcm', only a container
+signature counts as audio and only a body that parses as JSON as
+an error, since raw samples can start with any bytes."
   (let* ((raw (plist-get info :raw-file))
          (head (utter--file-head raw))
-         (kind (utter--sniff head)))
-    (pcase kind
-      ((or 'json 'text)
-       (funcall callback nil (format "HTTP %s with a %s body: %s"
-                                     (plist-get info :http-status)
-                                     (if (eq kind 'json) "JSON" "text")
-                                     (or (utter--error-from-file raw) "?"))))
-      ('empty (funcall callback nil "utter: empty response body"))
-      (_
-       (if (or (eq kind 'audio) (eq (plist-get info :format) 'pcm))
-           (funcall callback (plist-get info :file)
-                    (utter--write-audio (list :file raw) info))
-         (funcall callback nil (format "utter: response is not audio (starts with %S)"
-                                       (substring head 0 (min 8 (length head))))))))))
+         (kind (utter--sniff head))
+         (pcm (eq (plist-get info :format) 'pcm)))
+    (cond
+     ((eq kind 'empty) (funcall callback nil "utter: empty response body"))
+     ((and (memq kind '(json text))
+           (or (not pcm)
+               (and (< (file-attribute-size (file-attributes raw)) 65536)
+                    (utter--json-read-file raw))))
+      (funcall callback nil (format "HTTP %s with a %s body: %s"
+                                    (plist-get info :http-status)
+                                    (if (eq kind 'json) "JSON" "text")
+                                    (or (utter--error-from-file raw) "?"))))
+     ((or pcm (eq kind 'audio))
+      (funcall callback (plist-get info :file)
+               (utter--write-audio (list :file raw) info)))
+     (t (funcall callback nil (format "utter: response is not audio (starts with %S)"
+                                      (substring head 0 (min 8 (length head)))))))))
 
 (defun utter--json-path (json path)
   "Follow PATH into JSON and return the value, or nil.
@@ -960,6 +981,8 @@ Signals `utter-text-too-long' instead of splitting."
             (copy-file hit file t))
           (setq info (plist-put info :cached t))
           (setf (utter-request-info req) info)
+          (let ((utter-request-info info))
+            (run-hooks 'utter-pre-request-hook))
           (setf (utter-request-status req) 'running)
           (setf (utter-request-timer req)
                 (run-at-time 0 nil (lambda ()

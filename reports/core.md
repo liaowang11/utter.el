@@ -17,6 +17,11 @@ Behaviour notes beyond DESIGN.md:
 - The `bytes` sniffer also accepts ADTS/MPEG frame sync (`\xff` + byte ≥ `\xe0`)
   and `ftyp` at offset 4 (m4a), otherwise OpenAI `aac` and say `m4a` would be rejected.
   Unknown bytes are accepted only for `pcm`; HTML/XML bodies are errors like JSON.
+  For `pcm` requests only a string signature (`ID3 RIFF fLaC OggS FORM ftyp`)
+  counts as a container and only a body that parses as JSON is an error, so raw
+  samples starting `\xff\xff` or `{` are still wrapped; a container returned for a
+  pcm request is kept as is and INFO `:format` names it (e.g. mp3), though the file
+  name still ends in `.wav`.
 - PCM output is stored as `.wav` (cache file `<key>.wav`) and INFO `:format` is `wav`.
 - A default voice comes only from declared voice lists (model `:voices`, then the
   backend's list), never from a fetched list; so say's default backend uses the
@@ -29,12 +34,13 @@ Behaviour notes beyond DESIGN.md:
 - `utter-fetch-json` CALLBACK gets `(JSON)`, or `(JSON INFO)` if it accepts two args;
   JSON objects are alists, arrays lists; nil on failure.
 - `utter-pre-request-hook` / `utter-post-request-hook` are normal hooks; the INFO
-  plist is in the dynamic variable `utter-request-info` while they run.
+  plist is in the dynamic variable `utter-request-info` while they run. Both run
+  once per request, including cache hits.
 
 ## Verification
 
-- `make check` (compile + test), GNU Emacs 31.1.50: compile clean, `Ran 62 tests, 62 results as expected, 0 unexpected`.
-- `make EMACS=…/emacs-nox-30.2/bin/emacs check`: compile clean, 62/62.
+- `make check` (compile + test), GNU Emacs 31.1.50: compile clean, `Ran 63 tests, 63 results as expected, 0 unexpected`.
+- `make EMACS=…/emacs-nox-30.2/bin/emacs check`: compile clean, 63/63.
 - `make lint`: checkdoc clean on all five files.
 - curl path tested end to end against an in-process stub server
   (`make-network-process :server t` in `tests/utter-core-tests.el`): 200 mp3,
@@ -79,6 +85,14 @@ Needed from ENGINE (`utter.el`):
   (`utter-test-with-server`, `utter-test-requests`, `utter-test-wait`,
   `utter-test-request`, `utter-test-mp3`, `utter-test-wav-bytes`; the file
   `provide`s `utter-core-tests`) with ENV's `tests/support/utter-test-server.el`.
+  Symbols it defines, to grep for collisions: `utter-test-server`,
+  `utter-test-requests`, `utter-test-routes`, `utter-test-server-start`,
+  `utter-test--parse-request`, `utter-test--respond`, `utter-test-wait`,
+  `utter-test-with-server`, `utter-test-request`, `utter-test-mp3`,
+  `utter-test-wav-bytes`, `utter-test-with-temp-dir`, `utter-test-file-bytes`,
+  `utter-test-write-bytes`, `utter-test-with-authinfo`, `utter-test-backend`,
+  `utter-test--make-backend`, `utter-test-pe-backend`, `utter-test--pe-seen`,
+  `utter-test--key-var`.
 
 ## Unverified
 
