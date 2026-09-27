@@ -629,6 +629,16 @@ PATH is matched without the query string.")
       (should-not got)
       (should (equal (plist-get err :error) "HTTP 403: denied")))))
 
+(ert-deftest utter-core-test-json-path ()
+  (let ((json '((error . ((message . "m"))) (items ((k . "a") (v . 1)) ((k . "b") (v . 2))))))
+    ;; Symbols are keys even when they name functions.
+    (should (equal (utter--json-path json '(error message)) "m"))
+    (should (equal (utter--json-path json '(items 1 v)) 2))
+    (should (equal (utter--json-path json '(items (k . "b") v)) 2))
+    (should (equal (utter--json-path json '(items last k)) "b"))
+    (should (equal (utter--json-path json (list 'items (lambda (l) (car l)) 'k)) "a"))
+    (should-not (utter--json-path json '(nope k)))))
+
 ;;;; Voices cache
 
 (ert-deftest utter-core-test-list-voices-cache ()

@@ -732,7 +732,8 @@ for the headerless `pcm' format."
   "Follow PATH into JSON and return the value, or nil.
 Each element is a key symbol or string, an integer index, `last',
 a cons (KEY . VALUE) selecting the first array element whose KEY
-equals VALUE, or a function applied to the current value."
+equals VALUE, or a function object (not a symbol) applied to the
+current value."
   (let ((node json))
     (dolist (step path node)
       (setq node
@@ -740,7 +741,7 @@ equals VALUE, or a function applied to the current value."
              ((null node) nil)
              ((integerp step) (nth step node))
              ((eq step 'last) (car (last node)))
-             ((functionp step) (funcall step node))
+             ((and (functionp step) (not (symbolp step))) (funcall step node))
              ((consp step)
               (cl-find-if (lambda (e) (and (consp e) (consp (car e))
                                            (equal (alist-get (car step) e) (cdr step))))
