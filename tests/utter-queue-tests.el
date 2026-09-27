@@ -602,6 +602,17 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
       (should (= (length utter-eng--requests) 1))
       (should-not utter-eng--played))))
 
+(ert-deftest utter-queue-cache-only-finish-says-cached-and-does-not-notify ()
+  "Nothing played, so no \"finished\" message and no desktop notification."
+  (utter-eng-with-queue ((notified nil))
+    (let ((utter-notify-function (lambda (&rest args) (setq notified args))))
+      (utter-enqueue "Cache me." :cache-only t :source-name "notes")
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (member "utter: cached notes" utter-eng--messages))
+      (should-not (cl-some (lambda (m) (string-match-p "finished" m))
+                           utter-eng--messages))
+      (should-not notified))))
+
 (ert-deftest utter-queue-context-for-stitching-backends ()
   (utter-eng-with-queue ((utter-backend (utter-eng--backend :max-chars 20
                                                               :capabilities '(stitching)))

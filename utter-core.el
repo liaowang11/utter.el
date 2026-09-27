@@ -190,6 +190,22 @@ Return nil when nothing is known yet."
      ((consp bv) bv)
      (t (utter--cached-voices backend)))))
 
+(defun utter--model-valid-p (backend model)
+  "Return non-nil if MODEL is nil or one of BACKEND's models.
+A backend without a model list accepts any model."
+  (or (null model)
+      (null (utter-backend-models backend))
+      (memq model (mapcar #'utter--model-name (utter-backend-models backend)))))
+
+(defun utter--voice-valid-p (backend voice &optional model)
+  "Return non-nil if VOICE is nil or a known voice of BACKEND for MODEL.
+A voice list that is still to be fetched cannot be checked, so the
+voice counts as valid until the list is known."
+  (or (null voice)
+      (let ((voices (utter--static-voices backend model)))
+        (or (null voices)
+            (member voice (mapcar #'utter--voice-name voices))))))
+
 (defun utter--formats (backend &optional model)
   "Return the formats of BACKEND for MODEL; model-level `:formats' wins."
   (or (plist-get (utter--model-plist backend model) :formats)

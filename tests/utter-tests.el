@@ -294,6 +294,12 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
       (with-current-buffer "*utter-inspect*"
         (should (string-match-p "example.invalid" (buffer-string)))
         (should (string-match-p "Inspect this" (buffer-string))))
+      (kill-buffer "*utter-inspect*")
+      ;; The menu shares the same path for any text.
+      (with-temp-buffer
+        (utter--inspect-text "Given text."))
+      (with-current-buffer "*utter-inspect*"
+        (should (string-match-p "Given text" (buffer-string))))
       (kill-buffer "*utter-inspect*"))))
 
 (ert-deftest utter-select-voice-sets-with-scope ()
@@ -341,6 +347,79 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
     (let ((item (utter-enqueue "Second.")))
       (should (equal (plist-get (utter-item-params item) :voice) "global")))
     (should-not utter-enqueue-hook)))
+
+(ert-deftest utter-scope-oneshot-restores-buffer-local-values ()
+  "A oneshot set where the option is buffer-local restores that buffer, not the default."
+  (utter-eng-with-queue ((utter-speed 1.0))
+    (let ((a (generate-new-buffer "oneshot-a")) (b (generate-new-buffer "oneshot-b")))
+      (unwind-protect
+          (progn
+            (with-current-buffer a
+              (utter--set-with-scope 'utter-speed 1.5 t)
+              (utter--set-with-scope 'utter-speed 2.0 1)
+              (should (= utter-speed 2.0)))
+            (with-current-buffer b
+              (utter-enqueue "Next.")
+              (should (utter-eng--wait
+                       (lambda () (= (buffer-local-value 'utter-speed a) 1.5)) 1)))
+            (should (= (default-value 'utter-speed) 1.0))
+            (should (local-variable-p 'utter-speed a)))
+        (kill-buffer a) (kill-buffer b)))))
+
+;;;; Sanitizing settings
+
+(ert-deftest utter-sanitize-clears-settings-foreign-to-the-backend ()
+  (utter-eng-with-queue ((utter-backend (utter-eng--backend))
+                          (utter-model 'other-model) (utter-voice "nova"))
+    (utter--sanitize-settings)
+    (should-not utter-model)
+    (should-not utter-voice)
+    (setq utter-model 'fake-model utter-voice "v2")
+    (utter--sanitize-settings)
+    (should (eq utter-model 'fake-model))
+    (should (equal utter-voice "v2"))
+    ;; A voice list that is still to be fetched cannot be checked: keep it.
+    (let ((utter-backend (utter-eng--backend :voices 'fetch)))
+      (setq utter-voice "anything")
+      (utter--sanitize-settings)
+      (should (equal utter-voice "anything")))
+    ;; SKIP protects values the caller just set; SETTER receives the clears.
+    (let (set)
+      (setq utter-model 'other-model utter-voice "nova")
+      (utter--sanitize-settings nil (lambda (sym val) (push (cons sym val) set))
+                                '(utter-voice))
+      (should (equal set '((utter-model . nil)))))))
+
+(ert-deftest utter-preset-with-only-a-backend-drops-stale-model-and-voice ()
+  (utter-eng-with-queue ((utter--known-presets nil)
+                          (utter-backend (utter-eng--backend :name "A" :models '(a-model)
+                                                             :voices '("a1")))
+                          (utter-model 'a-model) (utter-voice "a1"))
+    (let ((b (utter-eng--backend :name "B" :models '(b-model) :voices '("b1"))))
+      (cl-letf (((symbol-function 'utter-get-backend)
+                 (lambda (name) (and (equal name "B") b))))
+        (utter--apply-preset '(:backend "B"))
+        (should (eq utter-backend b))
+        (should-not utter-model)
+        (should-not utter-voice)
+        ;; Values the preset sets itself are trusted.
+        (utter--apply-preset '(:backend "B" :voice "b1" :model b-model))
+        (should (equal utter-voice "b1"))
+        (should (eq utter-model 'b-model))))))
+
+;;;; Error wording
+
+(ert-deftest utter-command-errors-start-with-nothing-to-read-aloud ()
+  (utter-tests-capturing
+    (with-temp-buffer
+      (insert "text")
+      (let ((err (should-error (utter-speak-buffer t) :type 'user-error)))
+        (should (string-prefix-p "Nothing to read aloud" (cadr err)))))
+    (let ((kill-ring nil) (kill-ring-yank-pointer nil)
+          (interprogram-paste-function nil))
+      (let ((err (should-error (utter-speak-kill) :type 'user-error)))
+        (should (string-prefix-p "Nothing to read aloud" (cadr err)))))
+    (should-not calls)))
 
 ;;;; Presets
 

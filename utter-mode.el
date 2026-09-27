@@ -154,6 +154,7 @@ elapsed and total time, backend and voice, rate and key hints."
   "p"   #'utter-previous
   "+"   #'utter-rate-up
   "-"   #'utter-rate-down
+  "_"   #'utter-rate-down   ; same key as in `utter-menu', where `-' is taken
   "q"   #'utter-stop
   "x"   #'utter-clear
   "m"   #'utter-menu

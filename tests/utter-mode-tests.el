@@ -246,7 +246,8 @@ Recorded calls end up in `utter-ui-test--calls'."
 (ert-deftest utter-mode-test-keymap-read-only ()
   (dolist (pair '(("SPC" . utter-toggle-pause) ("n" . utter-next)
                   ("p" . utter-previous) ("+" . utter-rate-up)
-                  ("-" . utter-rate-down) ("q" . utter-stop)
+                  ("-" . utter-rate-down) ("_" . utter-rate-down)
+                  ("q" . utter-stop)
                   ("x" . utter-clear) ("m" . utter-menu)
                   ("Q" . utter-queue) ("RET" . utter-visit-source)))
     (should (eq (utter-ui-test--binding (car pair) t) (cdr pair)))
@@ -254,7 +255,7 @@ Recorded calls end up in `utter-ui-test--calls'."
                 (cdr pair)))))
 
 (ert-deftest utter-mode-test-keymap-writable-has-no-single-keys ()
-  (dolist (key '("SPC" "n" "p" "+" "-" "q" "x" "m" "Q"))
+  (dolist (key '("SPC" "n" "p" "+" "-" "_" "q" "x" "m" "Q"))
     (should-not (memq (utter-ui-test--binding key nil)
                       '(utter-toggle-pause utter-next utter-previous
                         utter-rate-up utter-rate-down utter-stop utter-clear

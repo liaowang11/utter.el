@@ -58,6 +58,8 @@
 (declare-function utter-backend-max-chars "utter-core" (backend))
 (declare-function utter-backend-max-chars-unit "utter-core" (backend))
 (declare-function utter--resolve-backend "utter-core" (backend))
+(declare-function utter--model-valid-p "utter-core" (backend model))
+(declare-function utter--voice-valid-p "utter-core" (backend voice &optional model))
 (declare-function utter--list-voices "utter-core" (backend callback))
 
 ;;;; Options
@@ -342,7 +344,8 @@ new `utter-item'."
   "Read the whole buffer aloud, or from point to the end with FROM-POINT."
   (interactive "P")
   (let ((beg (if from-point (point) (point-min))))
-    (when (>= beg (point-max)) (user-error "Nothing to read here"))
+    (when (>= beg (point-max))
+      (user-error "Nothing to read aloud: the buffer after point is blank"))
     (utter-enqueue (utter--buffer-text beg (point-max))
                    :source-buffer (current-buffer))))
 
@@ -350,9 +353,9 @@ new `utter-item'."
 (defun utter-speak-kill ()
   "Read the latest kill aloud."
   (interactive)
-  (let ((text (current-kill 0 t)))
+  (let ((text (ignore-errors (current-kill 0 t))))
     (unless (and text (string-match-p "[^ \t\n]" text))
-      (user-error "The kill ring is empty"))
+      (user-error "Nothing to read aloud: the kill ring is empty"))
     (utter-enqueue (substring-no-properties text) :source-name "kill ring")))
 
 (defun utter--text-for-command ()
@@ -367,7 +370,7 @@ Signal a `user-error' when TEXT needs several requests."
                                (or (utter-backend-max-chars backend)
                                    utter--default-max-chars)
                                (or (utter-backend-max-chars-unit backend) 'chars))))
-    (cond ((null pieces) (user-error "Nothing to read"))
+    (cond ((null pieces) (user-error "Nothing to read aloud: the text is blank"))
           ((cdr pieces)
            (user-error "The text needs %d requests; joining them into one \
 file (with ffmpeg) is not supported yet" (length pieces)))
@@ -404,8 +407,13 @@ Only text that fits one request can be saved for now."
   "Show the request `utter-speak' would send, without sending it.
 The dry run goes to the *utter-inspect* buffer; secrets are redacted."
   (interactive)
-  (let* ((text (utter--text-for-command))
-         (params (utter--snapshot-params nil text))
+  (utter--inspect-text (utter--text-for-command)))
+
+(defun utter--inspect-text (text)
+  "Show the first request TEXT would produce, without sending it.
+TEXT is taken from the current buffer, whose settings apply.  The
+dry run goes to the *utter-inspect* buffer; secrets are redacted."
+  (let* ((params (utter--snapshot-params nil text))
          (pieces (utter--split (utter--preprocess text (current-buffer))
                                (or (utter-backend-max-chars (plist-get params :backend))
                                    utter--default-max-chars)
@@ -485,18 +493,25 @@ the next utterance only: the old value comes back after the next
 the global value."
   (pcase scope
     (1 (unless (get sym 'utter-history)
-         (put sym 'utter-history (list (symbol-value sym)))
-         (letrec ((restore
-                   (lambda (&rest _)
-                     (remove-hook 'utter-enqueue-hook restore)
-                     ;; Deferred so a surrounding let binding does not
-                     ;; undo the restore.
-                     (run-at-time 0 nil
-                                  (lambda (s)
-                                    (set s (car (get s 'utter-history)))
-                                    (put s 'utter-history nil))
-                                  sym))))
-           (add-hook 'utter-enqueue-hook restore)))
+         ;; Remember where the old value lives: a buffer-local value is
+         ;; restored in its buffer, a global one through the default.
+         (let ((buffer (and (local-variable-p sym) (current-buffer))))
+           (put sym 'utter-history (list (symbol-value sym)))
+           (letrec ((restore
+                     (lambda (&rest _)
+                       (remove-hook 'utter-enqueue-hook restore)
+                       ;; Deferred so a surrounding let binding does not
+                       ;; undo the restore.
+                       (run-at-time 0 nil
+                                    (lambda (s)
+                                      (let ((old (car (get s 'utter-history))))
+                                        (cond ((null buffer) (set-default s old))
+                                              ((buffer-live-p buffer)
+                                               (with-current-buffer buffer
+                                                 (set s old)))))
+                                      (put s 'utter-history nil))
+                                    sym))))
+             (add-hook 'utter-enqueue-hook restore))))
        (set sym value))
     ('t (set (make-local-variable sym) value))
     (_ (kill-local-variable sym)
@@ -565,7 +580,8 @@ SETTER is a function of (SYMBOL VALUE) and defaults to `set'."
   (unless setter (setq setter #'set))
   (when (memq (type-of preset) '(symbol string))
     (funcall setter 'utter--preset preset))
-  (let ((spec (utter--preset-spec preset)))
+  (let ((spec (utter--preset-spec preset))
+        (backend nil) (set-vars nil))
     (when-let* ((pre (plist-get spec :pre))) (funcall pre))
     (dolist (parent (ensure-list (plist-get spec :parents)))
       (utter--apply-preset (utter--preset-spec parent) setter))
@@ -574,17 +590,39 @@ SETTER is a function of (SYMBOL VALUE) and defaults to `set'."
      do (pcase key
           ((or :description :parents :pre :post))
           (:backend
-           (funcall setter 'utter-backend
-                    (if (stringp val)
-                        (or (utter-get-backend val)
-                            (user-error "Cannot find utter backend %s" val))
-                      val)))
+           (setq backend (if (stringp val)
+                             (or (utter-get-backend val)
+                                 (user-error "Cannot find utter backend %s" val))
+                           val))
+           (funcall setter 'utter-backend backend))
           (_ (if-let* ((var (utter--preset-var key)))
-                 (funcall setter var val)
+                 (progn (push var set-vars)
+                        (funcall setter var val))
                (display-warning
                 '(utter presets)
                 (format "utter preset: no setting for %s, ignoring" key))))))
+    ;; A preset that switches the backend must not leave a model or voice
+    ;; the new backend does not have.
+    (when backend
+      (utter--sanitize-settings backend setter set-vars))
     (when-let* ((post (plist-get spec :post))) (funcall post))))
+
+(defun utter--sanitize-settings (&optional backend setter skip)
+  "Clear `utter-model' and `utter-voice' when BACKEND does not offer them.
+BACKEND defaults to `utter-backend'.  SETTER, a function of (SYMBOL
+VALUE), defaults to `set'.  Symbols in SKIP are left alone.  A voice
+whose list is still to be fetched is kept."
+  (let ((backend (or backend utter-backend))
+        (setter (or setter #'set)))
+    (when (stringp backend) (setq backend (utter-get-backend backend)))
+    (when (utter-backend-p backend)
+      (let ((model-ok (utter--model-valid-p backend utter-model)))
+        (unless (or (memq 'utter-model skip) model-ok)
+          (funcall setter 'utter-model nil))
+        (unless (or (memq 'utter-voice skip)
+                    (utter--voice-valid-p backend utter-voice
+                                          (and model-ok utter-model)))
+          (funcall setter 'utter-voice nil))))))
 
 (defmacro utter-with-preset (name &rest body)
   "Run BODY with utter preset NAME applied.

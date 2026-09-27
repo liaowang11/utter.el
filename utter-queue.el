@@ -803,9 +803,12 @@ Other utterances stay; a message says why."
           (utter--qstate-current q) nil)
     (utter--highlight-delete)
     (when (eq status 'done)
-      (message "utter: finished %s (%s)" (utter-item-source-name item)
-               (utter--format-duration elapsed))
-      (utter--notify (format "Finished %s" (utter-item-source-name item))))
+      (if (plist-get (utter-item-params item) :cache-only)
+          ;; Nothing was heard, so no "finished" and no notification.
+          (message "utter: cached %s" (utter-item-source-name item))
+        (message "utter: finished %s (%s)" (utter-item-source-name item)
+                 (utter--format-duration elapsed))
+        (utter--notify (format "Finished %s" (utter-item-source-name item)))))
     (run-hook-with-args 'utter-item-finished-functions item status)))
 
 (defun utter--play-segment (item seg)
