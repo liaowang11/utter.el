@@ -225,8 +225,11 @@ Recorded calls end up in `utter-ui-test--calls'."
       (should (memq #'utter-mode--refresh utter-item-finished-functions))
       (utter-mode -1)
       (should-not (memq #'utter-mode--refresh utter-progress-functions)))
-    (with-temp-buffer
-      (utter-mode 1))                   ; killed while the mode is on
+    ;; Killed while the mode is on (`with-temp-buffer' skips buffer hooks).
+    (let ((buf (generate-new-buffer "utter-kill-test")))
+      (with-current-buffer buf (utter-mode 1))
+      (should (memq #'utter-mode--refresh utter-progress-functions))
+      (kill-buffer buf))
     (should-not (memq #'utter-mode--refresh utter-progress-functions))))
 
 (defun utter-ui-test--binding (key read-only)
