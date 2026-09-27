@@ -45,12 +45,11 @@
                          '(utter-toggle-pause utter-next utter-previous
                            utter-rate-up utter-rate-down utter-clear
                            utter-stop))
-       (let ((utter--known-backends (utter-transient-test--backends)))
-         (setq utter-backend (cdar utter--known-backends))
+       (let* ((utter--known-backends (utter-transient-test--backends))
+              (utter-backend (cdar utter--known-backends)))
          (unwind-protect
              (progn (utter-menu) ,@body)
-           (transient--emergency-exit)
-           (setq utter-backend nil)))))))
+           (transient--emergency-exit)))))))
 
 (defun utter-transient-test--suffixes ()
   "Return an alist (KEY . OBJECT) of the shown suffixes and infixes."
@@ -138,6 +137,25 @@
                (lambda () (cl-incf refreshed))))
       (utter-transient--refresh-menu 'item 0 10)
       (should (= refreshed 1)))))
+
+(ert-deftest utter-transient-test-no-refresh-while-reading ()
+  "A refresh while an infix reads from the minibuffer waits for the next key."
+  (let ((transient--prefix (transient-prefix :command 'utter-menu))
+        (refreshed 0))
+    (cl-letf (((symbol-function 'transient--refresh-transient)
+               (lambda () (cl-incf refreshed)))
+              ((symbol-function 'active-minibuffer-window)
+               (lambda () (selected-window))))
+      (utter-transient--refresh-menu 'item 0 10)
+      (should (= refreshed 0)))))
+
+(ert-deftest utter-transient-test-refresh-on-queue-finished ()
+  (let ((utter-ui-test--state '(:status idle))
+        (utter-queue-finished-hook nil))
+    (utter-transient-test-with-menu
+      (should (memq #'utter-transient--refresh-menu utter-queue-finished-hook)))
+    (should-not (memq #'utter-transient--refresh-menu
+                      utter-queue-finished-hook))))
 
 ;; The real private function, on whichever transient is loaded.
 (ert-deftest utter-transient-test-refresh-redraws-open-menu ()

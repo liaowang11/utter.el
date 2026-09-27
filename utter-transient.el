@@ -37,6 +37,7 @@
 (defvar utter-playback-rate)
 (defvar utter-expert-commands)
 (defvar utter-progress-functions)
+(defvar utter-queue-finished-hook)
 (defvar utter--set-scope)
 (defvar utter--known-backends)
 (defvar utter--known-presets)
@@ -163,9 +164,13 @@ models."
 (defun utter-transient--refresh-menu (&rest _)
   "Redraw `utter-menu' if it is open, to update its heading and columns.
 Called from engine hooks and voice fetches, outside the command loop,
-so errors are demoted to messages."
+so errors are demoted to messages.  Does nothing while the minibuffer
+is active."
   (when (and transient--prefix
-             (eq (oref transient--prefix command) 'utter-menu))
+             (eq (oref transient--prefix command) 'utter-menu)
+             ;; An infix is reading input; `:refresh-suffixes' redraws
+             ;; after the next key instead.
+             (not (active-minibuffer-window)))
     (with-demoted-errors "utter: menu refresh failed: %S"
       (with-current-buffer (if (buffer-live-p transient--original-buffer)
                                transient--original-buffer
@@ -615,11 +620,15 @@ Either \"Idle\" or, for example,
   "Stop refreshing the menu once it has really closed."
   (unless transient--prefix
     (remove-hook 'utter-progress-functions #'utter-transient--refresh-menu)
+    (remove-hook 'utter-queue-finished-hook #'utter-transient--refresh-menu)
     (remove-hook 'transient-exit-hook #'utter-transient--remove-refresh)))
 
 (defun utter-transient--install-refresh ()
-  "Refresh the menu from `utter-progress-functions' while it is open."
+  "Refresh the menu while it is open.
+Progress updates the heading; the end of the queue hides the
+Playback column."
   (add-hook 'utter-progress-functions #'utter-transient--refresh-menu)
+  (add-hook 'utter-queue-finished-hook #'utter-transient--refresh-menu)
   (add-hook 'transient-exit-hook #'utter-transient--remove-refresh))
 
 ;;;; The menu
