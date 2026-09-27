@@ -611,7 +611,7 @@ Other utterances stay; a message says why."
 
 (defun utter--highlight-progress (item _start _end)
   "Move the highlight to the part of ITEM being spoken."
-  (when (utter-item-markers item)
+  (when (and (utter-item-p item) (utter-item-markers item))
     (if (utter--highlight-stale-p item)
         (utter--highlight-drop item)
       (let* ((m (nth (utter--item-position item) (utter-item-markers item)))
