@@ -32,9 +32,14 @@
   - `utter--suffix-inspect` runs a dry-run `utter-request` into
     `*utter-inspect*`, truncated to the backend's max-chars.
   - Live heading: opening the menu puts `utter-transient--refresh-menu` on
-    `utter-progress-functions`. That function calls `transient--refresh-transient`
-    only under the `(eq (oref transient--prefix command) 'utter-menu)` guard,
-    inside the original buffer and `with-demoted-errors`. A
+    `utter-progress-functions`. I also put it on `utter-queue-finished-hook`,
+    which goes beyond the brief, so the Playback column disappears as soon as
+    the queue empties (mockup screen B). The function calls
+    `transient--refresh-transient` only under the
+    `(eq (oref transient--prefix command) 'utter-menu)` guard, only when no
+    minibuffer is active (an infix reader may be open, for example while a
+    voice list arrives), inside the original buffer and
+    `with-demoted-errors`. A
     `transient-exit-hook` removes it once `transient--prefix` is nil, which
     means the menu really closed. The exit hook also runs on a `replace`
     redraw, so it checks before removing.
@@ -74,9 +79,9 @@
 ## Verification
 
 - `make check` on Emacs 31.1.50 with transient 0.13.8: compile clean,
-  **46 tests, 46 expected**.
+  **48 tests, 48 expected**.
 - `make check EMACS=/nix/store/b6n5yar58b47aby6zi51vxlh901rdw4a-emacs-30.2/bin/emacs`
-  (bare Emacs 30.2 with its bundled transient 0.7.2.2): compile clean, 46/46.
+  (bare Emacs 30.2 with its bundled transient 0.7.2.2): compile clean, 48/48.
 - `make lint` (checkdoc): clean for `utter-mode.el`, `utter-transient.el` and `utter.el`.
 - The menu tests really run `transient-setup` in batch. They check the
   shown keys and commands, `:transient t`, `refresh-suffixes`,
@@ -87,9 +92,11 @@
   current buffer, and checks that the Playback column and heading show up.
 - The fake engine lives in `tests/utter-mode-tests.el`. It stubs only plain
   functions, inside `cl-letf`. `utter-item` and `utter-backend` structs are
-  defined only when `make-utter-item` or `utter--make-backend` are missing,
-  using DESIGN.md's slots, so after the merge the tests use the real
-  constructors. There are no top-level `defalias` calls on engine symbols.
+  defined only when `(cl-find-class ...)` finds no class, using DESIGN.md's
+  slots, so after the merge the tests use the real structs. The
+  `cl-defstruct` forms are quoted and `eval`ed, because eager
+  macroexpansion would otherwise register the class before the guard runs.
+  The tests `let`-bind `utter-backend`; they never `setq` it. There are no top-level `defalias` calls on engine symbols.
 - A test greps the four UI files for the internal unit word, case-insensitive.
 
 ## Transient version findings
@@ -186,6 +193,11 @@ the guard is noted:
   the bare symbol in `utter-model`. The `(SYMBOL . PLIST)` form keeps the
   metadata with the backend definition and does not touch global symbol
   plists.
+- ENGINE `utter.el` must reach `utter-menu` and `utter-queue` through
+  autoloads (`utter-transient.el` has the `;;;###autoload` cookie for
+  `utter-menu`). It must never `require` `utter-transient` or `utter-mode`,
+  because both `(require 'utter)`, so that would create a require cycle.
+  This matters for `C-u utter-speak`, which opens the menu.
 - Package: `Package-Requires` `transient` minimum, see above.
 
 ## Unverified
@@ -201,5 +213,12 @@ the guard is noted:
 - The evil visual-state fix with real evil (tested with stubbed evil
   functions only).
 - Behaviour against the real ENGINE/CORE: every engine call here is a fake.
+- Not run on Linux. I ran only on darwin, and the tests need no
+  macOS-only binaries: Org is bundled, and nothing calls `say`, `afplay`,
+  or the network.
+- The `RET` label "(appends as utterance N)" reads `(transient-args
+  'utter-menu)` while the menu renders. On transient 0.7.2.2 this may
+  return saved values rather than the live switches, so the label can be
+  wrong for one redraw when `S`/`f`/`c` is toggled. This is cosmetic.
 - The `o` input before the first Org heading signals Org's own error, not
   a friendly message.
