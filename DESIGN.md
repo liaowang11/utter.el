@@ -373,3 +373,16 @@ pass with `make check` on Emacs 31.1.50 and 30.2 on macOS; CI runs Linux
 30.1, Linux snapshot and macOS. End-to-end in batch with the `say` backend:
 `utter-speak-string` → aiff in the cache → afplay → idle in 4.3 s.
 Per-module reports with HANDOFF and unverified lists are in `reports/`.
+
+Real-server checks (2026-09-27, batch Emacs, keys from `pass`):
+- OpenAI `/v1/audio/speech`: request accepted, 401 with the vendor message
+  parsed (the stored key is dead); the shape is right, audio not yet heard.
+- OpenRouter: `utter-fetch-json` listed 21 speech models;
+  `google/gemini-3.8-flash-tts` requires `response_format` `pcm` (400 with a
+  clear message otherwise); with `:format pcm` core wrapped the PCM into a
+  7.3 s WAV that afplay played. Deepgram `flux-tts:free` needs its own voice
+  names (`flux-*-en`), so per-model voice lists matter.
+- Menu opened against the real engine in batch; `utter--suffix-speak nil`
+  spoke the sentence at point; heading rendered live state; three-utterance
+  run exercised prefetch, pause/resume (SIGSTOP), `utter-next`, lighter
+  strings `♪1/3⟳ ♪1/3 ♪1/3⏸ ♪2/3`.
