@@ -40,7 +40,12 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
                     (utter-highlight-follow . nil) (utter-lighter . " ♪%i/%n")
                     (utter-prefetch-depth . 2) (utter-max-concurrent-requests . 2)
                     (utter-player . auto)
-                    (utter-thing-at-point-functions . (utter--gptel-response-at-point))
+                    (utter-input-functions . (utter--gptel-response-at-point
+                                              utter--org-subtree-at-point
+                                              utter--page-at-point))
+                    (utter-page-modes . (eww-mode Info-mode nov-mode help-mode
+                                         Man-mode woman-mode))
+                    (utter-org-input . subtree)
                     (utter-expert-commands . nil)))
       (should (custom-variable-p (car pair)))
       (should (equal (std (car pair)) (cdr pair))))
@@ -75,30 +80,109 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
       (should (equal (nth 1 (car calls)) "The answer. It has two sentences."))
       (should (= (point) 15)))))
 
-(ert-deftest utter-speak-thing-at-point-functions-are-tried-in-order ()
+(ert-deftest utter-speak-input-functions-are-tried-in-order ()
   (utter-tests-capturing
     (with-temp-buffer
       (insert "abcdef. ghi.")
       (goto-char 2)
-      (let ((utter-thing-at-point-functions
+      (let ((utter-input-functions
              (list (lambda () nil) (lambda () (cons 3 5)))))
         (utter-speak)
         (should (equal (nth 1 (car calls)) "cd"))))))
 
-(ert-deftest utter-speak-reads-sentence-at-point ()
+(ert-deftest utter-speak-reads-buffer-to-point ()
+  "Like gptel: no region means the buffer from its start to point."
   (utter-tests-capturing
     (with-temp-buffer
       (insert "First sentence.  Second sentence here.  Third one.")
-      (goto-char 22)
+      (goto-char 39)
       (utter-speak)
-      (should (equal (nth 1 (car calls)) "Second sentence here."))
-      (should (= (point) 22)))))
+      (should (equal (nth 1 (car calls)) "First sentence.  Second sentence here."))
+      (should (= (point) 39)))))
 
-(ert-deftest utter-speak-never-reads-whole-buffer-implicitly ()
+(ert-deftest utter-speak-at-buffer-start-reads-whole-buffer ()
+  "Nothing before point (a freshly opened file) means the whole buffer."
+  (utter-tests-capturing
+    (with-temp-buffer
+      (insert "Alpha.  Beta.")
+      (goto-char (point-min))
+      (utter-speak)
+      (should (equal (nth 1 (car calls)) "Alpha.  Beta."))
+      (goto-char 2)
+      (utter-speak)
+      (should (equal (nth 1 (car calls)) "A")))))
+
+(ert-deftest utter-speak-errors-on-a-blank-buffer ()
   (utter-tests-capturing
     (with-temp-buffer
       (should-error (utter-speak) :type 'user-error)
+      (insert "  \n\t")
+      (should-error (utter-speak) :type 'user-error)
       (should-not calls))))
+
+(ert-deftest utter-speak-errors-on-a-blank-region ()
+  (utter-tests-capturing
+    (with-temp-buffer
+      (transient-mark-mode 1)
+      (insert "Words   here.")
+      (set-mark 6)
+      (goto-char 9)
+      (activate-mark)
+      (let ((err (should-error (utter-speak) :type 'user-error)))
+        (should (string-match-p "region" (cadr err))))
+      (should-not calls))))
+
+(ert-deftest utter-speak-org-reads-the-subtree-at-point ()
+  (utter-tests-capturing
+    (with-temp-buffer
+      (insert "Preamble.\n* A\nalpha\n** A1\nbeta\n* B\ngamma\n")
+      (org-mode)
+      (goto-char (point-min))
+      (search-forward "alpha")
+      (utter-speak)
+      (should (equal (nth 1 (car calls)) "* A\nalpha\n** A1\nbeta\n"))
+      ;; Before the first heading there is no subtree: buffer to point.
+      (goto-char 6)
+      (utter-speak)
+      (should (equal (nth 1 (car calls)) "Pream"))
+      ;; The option turns the heuristic off.
+      (search-forward "beta")
+      (let ((utter-org-input 'to-point))
+        (utter-speak)
+        (should (equal (nth 1 (car calls))
+                       "Preamble.\n* A\nalpha\n** A1\nbeta"))))))
+
+(ert-deftest utter-speak-page-modes-read-the-whole-page ()
+  (utter-tests-capturing
+    (with-temp-buffer
+      (insert "Rendered page text.  More of it.")
+      (goto-char 10)
+      (setq major-mode 'eww-mode)
+      (utter-speak)
+      (should (equal (nth 1 (car calls)) "Rendered page text.  More of it."))
+      (let ((utter-page-modes nil))
+        (utter-speak)
+        (should (equal (nth 1 (car calls)) "Rendered "))))))
+
+(ert-deftest utter-input-label-names-the-source ()
+  (with-temp-buffer
+    (insert "Some text.")
+    (goto-char (point-max))
+    (should (equal (utter-input-label) "buffer to point"))
+    (goto-char (point-min))
+    (should (equal (utter-input-label) "whole buffer"))
+    (transient-mark-mode 1)
+    (set-mark 1) (goto-char 5) (activate-mark)
+    (should (equal (utter-input-label) "region"))
+    (deactivate-mark)
+    (setq major-mode 'Info-mode)
+    (should (equal (utter-input-label) "page"))
+    (org-mode)
+    (erase-buffer)
+    (insert "* H\nbody")
+    (should (equal (utter-input-label) "Org subtree"))
+    (erase-buffer)
+    (should (equal (utter-input-label) "nothing"))))
 
 (ert-deftest utter-speak-prefix-opens-menu ()
   (let ((opened nil))
@@ -166,7 +250,6 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
   (utter-eng-with-queue ()
     (with-temp-buffer
       (insert "Spoken for real.")
-      (goto-char 3)
       (utter-speak)
       (should (utter-eng--wait #'utter-eng--idle-p))
       (should (equal (utter-eng--texts) '("Spoken for real.")))
@@ -206,7 +289,6 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
                        :curl-args '("-s")))))
       (with-temp-buffer
         (insert "Inspect this.")
-        (goto-char 2)
         (utter-inspect-query))
       (should dry)
       (with-current-buffer "*utter-inspect*"
@@ -234,8 +316,8 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
 (ert-deftest utter-text-at-point-for-the-menu ()
   (with-temp-buffer
     (insert "One here.  Two there.")
-    (goto-char 14)
-    (should (equal (utter--text-at-point) (cons "Two there." (buffer-name))))
+    (goto-char 10)
+    (should (equal (utter--text-at-point) (cons "One here." (buffer-name))))
     (erase-buffer)
     (should-error (utter--text-at-point) :type 'user-error)))
 

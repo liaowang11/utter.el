@@ -113,7 +113,7 @@ are passed to curl on stdin, never on the command line.
 | Command | What it does |
 |---|---|
 | `utter-menu` | The transient menu: backend, voice, speed, format, language, input, output, playback |
-| `utter-speak` | Speak the region, else the thing at point (such as a gptel response), else the sentence at point; appends. `C-u` opens the menu |
+| `utter-speak` | Speak the region, else a source that claims point (gptel response, Org subtree, rendered page; see `utter-input-functions`), else the buffer from its start to point, as gptel does; appends. `C-u` opens the menu |
 | `utter-speak-interrupt` | Same text selection, but stop what is playing and speak it now |
 | `utter-speak-buffer` | Speak the buffer (from point with a prefix argument) |
 | `utter-speak-kill` | Speak the latest kill |

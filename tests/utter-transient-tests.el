@@ -67,26 +67,29 @@
     (utter-transient-test-with-menu
       (let ((keys (mapcar #'car (utter-transient-test--suffixes))))
         (dolist (key '("-m" "-v" "-s" "-f" "-l" "-i" "-H" "=" "@"
-                       "r" "b" "o" "e" "y" "m" "t" "s" "S" "f" "c" "RET"))
+                       "y" "m" "s" "S" "f" "c" "RET"))
           (should (member key keys)))
-        (dolist (key '("SPC" "n" "p" "+" "_" "x" "q" "Q"))
+        ;; Input is a heuristic, not a switch per source.
+        (dolist (key '("SPC" "n" "p" "+" "_" "x" "q" "Q" "r" "b" "o" "e" "t"))
           (should-not (member key keys))))
       (should (eq (oref (cdr (assoc "RET" (utter-transient-test--suffixes)))
                         command)
                   'utter--suffix-speak))
       (should (oref transient--prefix refresh-suffixes))
       (should (equal (oref transient--prefix incompatible)
-                     '(("r" "b" "o" "e" "y" "m" "t") ("s" "S" "f" "c"))))
+                     '(("m" "y") ("s" "S" "f" "c"))))
       (let ((text (utter-transient-test--menu-text)))
         (should (string-prefix-p "Idle" text))
-        (dolist (label '("Backend" "Input <" "Output >" "Backend:model"
-                         "OpenAI:gpt-4o-mini-tts" "Highlight spoken text"
-                         "Region (default)" "Buffer from point"
-                         "Org subtree" "EWW / Info page" "Kill-ring"
-                         "Minibuffer" "String from Lisp"
+        (dolist (label '("Backend" "Input < nothing" "Output >"
+                         "Backend:model" "OpenAI:gpt-4o-mini-tts"
+                         "Highlight spoken text"
+                         "Kill-ring instead" "Minibuffer instead"
                          "Speakers, append (default)" "Speakers, interrupt"
                          "Save to file" "Cache only" "Speak"))
           (should (string-search label text)))
+        (dolist (label '("Region (default)" "Buffer from point" "Org subtree"
+                         "EWW / Info page" "String from Lisp"))
+          (should-not (string-search label text)))
         (should-not (string-search "Playback" text))
         (should-not (string-search "Inspect" text))))))
 
@@ -209,8 +212,7 @@
      (insert ,text)
      (goto-char (point-min))
      (utter-ui-test-with-engine
-       (cl-letf (((symbol-function 'utter--text-at-point) nil))
-         ,@body))))
+       ,@body)))
 
 (defun utter-transient-test--last-call ()
   "Return the newest recorded engine call."
@@ -222,7 +224,7 @@
     (set-mark 5)
     (goto-char 8)
     (activate-mark)
-    (dolist (args '(nil ("r") ("s") ("r" "s")))
+    (dolist (args '(nil ("s")))
       (setq utter-ui-test--calls nil)
       (utter--suffix-speak args)
       (let ((call (utter-transient-test--last-call)))
@@ -233,12 +235,33 @@
         (should (equal (plist-get (nthcdr 2 call) :source-name)
                        (buffer-name)))))))
 
-(ert-deftest utter-transient-test-speak-default-sentence ()
+(ert-deftest utter-transient-test-speak-default-buffer-to-point ()
+  "Without a region RET reads the buffer up to point, as gptel does."
   (utter-transient-test-with-text "One two. Three four."
-    (setq-local sentence-end-double-space nil)
-    (goto-char 12)
+    (goto-char 9)
     (utter--suffix-speak nil)
-    (should (equal (nth 1 (utter-transient-test--last-call)) "Three four."))))
+    (should (equal (nth 1 (utter-transient-test--last-call)) "One two."))
+    (goto-char (point-max))
+    (utter--suffix-speak nil)
+    (should (equal (nth 1 (utter-transient-test--last-call))
+                   "One two. Three four."))))
+
+(ert-deftest utter-transient-test-input-description-shows-the-source ()
+  (utter-transient-test-with-text "One two. Three four."
+    (goto-char 9)
+    (should (equal (utter-transient--input-description) "Input < buffer to point"))
+    (transient-mark-mode 1)
+    (set-mark 1) (goto-char 4) (activate-mark)
+    (should (equal (utter-transient--input-description) "Input < region"))))
+
+(ert-deftest utter-transient-test-speak-highlight-carries-tags ()
+  "RET goes through the engine's text path, so highlight tags survive."
+  (utter-transient-test-with-text "Some text."
+    (goto-char (point-max))
+    (let ((utter-highlight t))
+      (utter--suffix-speak nil)
+      (should (equal (nth 1 (utter-transient-test--last-call))
+                     (utter--buffer-text (point-min) (point-max)))))))
 
 (ert-deftest utter-transient-test-speak-uses-engine-text-at-point ()
   (utter-transient-test-with-text "whatever"
@@ -252,13 +275,6 @@
 
 (ert-deftest utter-transient-test-speak-inputs ()
   (utter-transient-test-with-text "Head.\nMiddle part. End part."
-    (goto-char (point-min))
-    (search-forward "End")
-    (utter--suffix-speak '("b"))
-    (should (equal (nth 1 (utter-transient-test--last-call)) " part."))
-    (utter--suffix-speak '("e"))
-    (should (equal (nth 1 (utter-transient-test--last-call))
-                   "Head.\nMiddle part. End part."))
     (let ((kill-ring '("killed text")) (kill-ring-yank-pointer nil)
           (interprogram-paste-function nil))
       (utter--suffix-speak '("y"))
@@ -266,42 +282,33 @@
       (should (equal (plist-get (nthcdr 2 (utter-transient-test--last-call))
                                 :source-name)
                      "kill-ring")))
+    (let ((kill-ring nil) (kill-ring-yank-pointer nil)
+          (interprogram-paste-function nil))
+      (let ((err (should-error (utter--suffix-speak '("y")) :type 'user-error)))
+        (should (string-match-p "kill ring" (cadr err)))))
     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "typed")))
       (utter--suffix-speak '("m"))
       (should (equal (nth 1 (utter-transient-test--last-call)) "typed")))
-    (cl-letf (((symbol-function 'read--expression)
-               (lambda (&rest _) '(concat "from " "lisp"))))
-      (utter--suffix-speak '("t"))
-      (should (equal (nth 1 (utter-transient-test--last-call)) "from lisp")))
-    (cl-letf (((symbol-function 'read--expression) (lambda (&rest _) 42)))
-      (utter--suffix-speak '("t"))
-      (should (equal (nth 1 (utter-transient-test--last-call)) "42")))))
-
-(ert-deftest utter-transient-test-speak-org-subtree ()
-  (utter-transient-test-with-text "* A\nalpha\n** A1\nbeta\n* B\ngamma\n"
-    (should-error (utter--suffix-speak '("o")) :type 'user-error)
-    (org-mode)
-    (goto-char (point-min))
-    (search-forward "alpha")
-    (utter--suffix-speak '("o"))
-    (should (equal (nth 1 (utter-transient-test--last-call))
-                   "* A\nalpha\n** A1\nbeta\n"))))
+    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "  ")))
+      (let ((err (should-error (utter--suffix-speak '("m")) :type 'user-error)))
+        (should (string-match-p "minibuffer" (cadr err)))))))
 
 (ert-deftest utter-transient-test-speak-outputs ()
   (utter-transient-test-with-text "Some text."
-    (utter--suffix-speak '("e" "S"))
+    (goto-char (point-max))
+    (utter--suffix-speak '("S"))
     (should (equal (utter-transient-test--last-call)
                    (list 'utter-interrupt "Some text."
                          :source-buffer (current-buffer)
                          :source-name (buffer-name))))
-    (utter--suffix-speak '("e" "c"))
+    (utter--suffix-speak '("c"))
     (should (equal (utter-transient-test--last-call)
                    (list 'utter-enqueue "Some text." :cache-only t
                          :source-buffer (current-buffer)
                          :source-name (buffer-name))))
     (cl-letf (((symbol-function 'read-file-name)
                (lambda (&rest _) "/tmp/out.mp3")))
-      (utter--suffix-speak '("e" "f"))
+      (utter--suffix-speak '("f"))
       (should (equal (utter-transient-test--last-call)
                      '(utter-save-to-file "Some text." "/tmp/out.mp3"))))))
 
@@ -312,7 +319,7 @@
               ((symbol-function 'read--expression) (lambda (&rest _) "lisp"))
               ((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/x"))
               (kill-ring '("kill")))
-      (dolist (input '(nil "r" "b" "e" "y" "m" "t"))
+      (dolist (input '(nil "y" "m"))
         (dolist (output '(nil "s" "S" "f" "c"))
           (setq utter-ui-test--calls nil)
           (goto-char (point-min))
@@ -326,7 +333,7 @@
 
 (ert-deftest utter-transient-test-speak-empty ()
   (utter-transient-test-with-text "   "
-    (should-error (utter--suffix-speak '("e")) :type 'user-error)
+    (should-error (utter--suffix-speak nil) :type 'user-error)
     (should-not utter-ui-test--calls)))
 
 ;;;; Infix classes

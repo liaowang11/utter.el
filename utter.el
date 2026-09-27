@@ -27,9 +27,9 @@
 ;;
 ;; Main commands (none is bound by default):
 ;;
-;; - `utter-speak': the region, else the thing at point (for example a
-;;   gptel response), else the sentence at point.  With C-u, open
-;;   `utter-menu'.
+;; - `utter-speak': the region, else a source that claims point (a gptel
+;;   response, an Org subtree, a rendered page), else the buffer from
+;;   its start to point, as gptel does.  With C-u, open `utter-menu'.
 ;; - `utter-speak-interrupt': the same, but cut in front of the queue.
 ;; - `utter-speak-buffer', `utter-speak-kill', `utter-speak-string'.
 ;; - `utter-toggle-pause', `utter-next', `utter-previous', `utter-stop',
@@ -157,12 +157,31 @@ from `utter-player-afplay' (macOS), `utter-player-ffplay' and
   :type '(choice (const auto) symbol sexp)
   :group 'utter)
 
-(defcustom utter-thing-at-point-functions '(utter--gptel-response-at-point)
-  "Functions that find the text `utter-speak' reads when there is no region.
-Each is called with no arguments and returns (BEG . END) or nil.
-The first non-nil result wins; when all return nil, the sentence
-at point is read."
+(defcustom utter-input-functions '(utter--gptel-response-at-point
+                                   utter--org-subtree-at-point
+                                   utter--page-at-point)
+  "Functions that choose the text to read when there is no active region.
+Each is called with no arguments in the source buffer and returns
+\(BEG . END), or nil to pass.  The first non-nil result wins; when
+all pass, the buffer from its start to point is read, or the whole
+buffer when point is at its start.  A function may name its source
+for the menu with an `utter-input-label' symbol property."
   :type 'hook
+  :group 'utter)
+
+(defcustom utter-page-modes '(eww-mode Info-mode nov-mode help-mode
+                              Man-mode woman-mode)
+  "Major modes whose buffers are rendered pages and are read whole.
+Compared with `derived-mode-p' by `utter--page-at-point'."
+  :type '(repeat symbol)
+  :group 'utter)
+
+(defcustom utter-org-input 'subtree
+  "What to read in an Org buffer that has no active region.
+`subtree' reads the subtree at point; `to-point' treats Org like
+any other buffer and reads from its start to point."
+  :type '(choice (const :tag "Subtree at point" subtree)
+                 (const :tag "Buffer to point" to-point))
   :group 'utter)
 
 (defcustom utter-expert-commands nil
@@ -177,7 +196,7 @@ at point is read."
 Nil sets the global value, t sets it buffer-locally, and 1 sets
 it for the next utterance only.")
 
-;;;; Text at point
+;;;; Input: what to read
 
 (defun utter--gptel-response-p (pos)
   "Return non-nil if the character at POS is part of a gptel response."
@@ -194,26 +213,83 @@ Reads the `gptel' text property, so gptel need not be loaded."
                           (1- (point))))))
     (cons (previous-single-property-change (1+ pos) 'gptel nil (point-min))
           (next-single-property-change pos 'gptel nil (point-max)))))
+(put 'utter--gptel-response-at-point 'utter-input-label "gptel response")
+
+(declare-function org-before-first-heading-p "org")
+(declare-function org-back-to-heading "org")
+(declare-function org-end-of-subtree "org")
+
+(defun utter--org-subtree-at-point ()
+  "Return (BEG . END) of the Org subtree at point, or nil.
+Nil outside Org, before the first heading, or when `utter-org-input'
+is not `subtree'."
+  (when (and (derived-mode-p 'org-mode)
+             (eq utter-org-input 'subtree)
+             (fboundp 'org-before-first-heading-p)
+             (not (org-before-first-heading-p)))
+    (save-excursion
+      (org-back-to-heading t)
+      (let ((beg (point)))
+        (org-end-of-subtree t t)
+        (cons beg (point))))))
+(put 'utter--org-subtree-at-point 'utter-input-label "Org subtree")
+
+(defun utter--page-at-point ()
+  "Return the whole buffer as (BEG . END) in `utter-page-modes', else nil."
+  (when (derived-mode-p utter-page-modes)
+    (cons (point-min) (point-max))))
+(put 'utter--page-at-point 'utter-input-label "page")
+
+(defun utter--blank-p (beg end)
+  "Return non-nil when the text between BEG and END is only whitespace."
+  (not (string-match-p "[^ \t\n\r]"
+                       (buffer-substring-no-properties beg end))))
+
+(defun utter--input-candidate ()
+  "Return (BEG END LABEL) for the text `utter-speak' would read.
+The active region wins; else the first claim of
+`utter-input-functions'; else the buffer from its start to point,
+or the whole buffer when nothing precedes point.  LABEL names the
+source for the menu and for error messages.  The text may still
+be blank; `utter--text-bounds' checks that."
+  (cond
+   ((use-region-p) (list (region-beginning) (region-end) "region"))
+   ((cl-loop for fn in utter-input-functions
+             for bounds = (funcall fn)
+             when bounds
+             return (list (car bounds) (cdr bounds)
+                          (or (and (symbolp fn) (get fn 'utter-input-label))
+                              (and (symbolp fn) (symbol-name fn))
+                              "input function"))))
+   ((utter--blank-p (point-min) (point))
+    (list (point-min) (point-max) "whole buffer"))
+   (t (list (point-min) (point) "buffer to point"))))
 
 (defun utter--text-bounds ()
-  "Return (BEG . END) of the text `utter-speak' reads, or nil.
-The region if active, else the first claim of
-`utter-thing-at-point-functions', else the sentence at point."
-  (let ((b (cond ((use-region-p) (cons (region-beginning) (region-end)))
-                 ((run-hook-with-args-until-success 'utter-thing-at-point-functions))
-                 (t (bounds-of-thing-at-point 'sentence)))))
-    (and b (< (car b) (cdr b))
-         (string-match-p "[^ \t\n]" (buffer-substring-no-properties (car b) (cdr b)))
-         b)))
+  "Return (BEG END LABEL) of the text `utter-speak' reads.
+Signal a `user-error' naming the source when it is blank."
+  (pcase-let ((`(,beg ,end ,label) (utter--input-candidate)))
+    (when (utter--blank-p beg end)
+      (user-error "Nothing to read aloud: the %s is blank" label))
+    (list beg end label)))
+
+(defun utter-input-label ()
+  "Return a short name for what `utter-speak' would read here.
+One of \"region\", a provider label such as \"Org subtree\" or
+\"page\", \"buffer to point\", \"whole buffer\", or \"nothing\"
+when that text is blank."
+  (or (ignore-errors
+        (pcase-let ((`(,beg ,end ,label) (utter--input-candidate)))
+          (if (utter--blank-p beg end) "nothing" label)))
+      "nothing"))
 
 (defun utter--text-at-point (&optional _arg)
   "Return (TEXT . SOURCE-NAME) for what `utter-speak' reads.
-TEXT is the region, else the first claim of
-`utter-thing-at-point-functions', else the sentence at point.
-When `utter-highlight' is on, TEXT carries position tags.  Signal
-a `user-error' when there is nothing to read."
-  (let ((b (or (utter--text-bounds) (user-error "Nothing to read here"))))
-    (cons (utter--buffer-text (car b) (cdr b)) (buffer-name))))
+TEXT is chosen by `utter--text-bounds'; when `utter-highlight' is
+on it carries position tags.  Signal a `user-error' when there is
+nothing to read."
+  (pcase-let ((`(,beg ,end ,_) (utter--text-bounds)))
+    (cons (utter--buffer-text beg end) (buffer-name))))
 
 (defun utter--speak-at-point (function)
   "Pass the text at point to FUNCTION, `utter-enqueue' or `utter-interrupt'."
@@ -228,10 +304,11 @@ a `user-error' when there is nothing to read."
 
 ;;;###autoload
 (defun utter-speak (&optional arg)
-  "Read aloud the region, the thing at point, or the sentence at point.
-The text is appended to the queue.  The thing at point is found by
-`utter-thing-at-point-functions', for example a gptel response.
-With prefix ARG, open `utter-menu' instead."
+  "Read aloud the region, else the buffer from its start to point.
+The text is appended to the queue.  Between the two, a source from
+`utter-input-functions' may claim point instead: a gptel response,
+an Org subtree, or a rendered page in `utter-page-modes'.  With
+prefix ARG, open `utter-menu' instead."
   (interactive "P")
   (if arg
       (utter--open-menu)

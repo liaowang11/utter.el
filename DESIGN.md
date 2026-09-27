@@ -249,7 +249,7 @@ only thing that may move point or recenter.
 ### Commands and defcustoms (ENGINE, in `utter.el`)
 
 ```elisp
-(utter-speak &optional ARG)          ; region → thing at point (utter-thing-at-point-functions) → sentence at point; C-u opens utter-menu
+(utter-speak &optional ARG)          ; region → source claiming point (utter-input-functions) → buffer start to point (whole buffer when point is at the start); C-u opens utter-menu
 (utter-speak-interrupt &optional ARG); same text selection, via utter-interrupt
 (utter-speak-string STRING &rest PARAMS)   ; non-UI entry point; works from emacsclient -e
 (utter-speak-buffer &optional FROM-POINT)
@@ -277,7 +277,9 @@ only thing that may move point or recenter.
 | `utter-voice-cache-ttl` | 86400 |
 | `utter-player` | `auto` |
 | `utter-curl-program`, `utter-proxy`, `utter-log-level` | "curl", "", nil |
-| `utter-thing-at-point-functions` | `(utter--gptel-response-at-point)` (reads the `gptel` text property; no require) |
+| `utter-input-functions` | `(utter--gptel-response-at-point utter--org-subtree-at-point utter--page-at-point)`; each returns (BEG . END) or nil, labelled for the menu by the `utter-input-label` symbol property |
+| `utter-page-modes` | `(eww-mode Info-mode nov-mode help-mode Man-mode woman-mode)`, read whole |
+| `utter-org-input` | `subtree` (or `to-point`) |
 | `utter-expert-commands` | nil |
 
 Scope: `utter--set-scope` (nil global, t buffer-local, 1 oneshot) and
@@ -299,7 +301,7 @@ other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
 [:description utter--menu-heading]          ; "Idle" | "Playing reading-aloud.org (2/5) · OpenAI:gpt-4o-mini-tts/nova · 1.0x"
  ["Backend"  -m Backend:model  -v Voice  -s Speed  -f Format  -l Language  -i Instructions
              -H Highlight spoken text  = Scope  @ Preset]
- ["Input <"  r Region (default)  b Buffer from point  o Org subtree  e EWW / Info page  y Kill-ring  m Minibuffer  t String from Lisp]
+ ["Input < <label>"  m Minibuffer instead  y Kill-ring instead]   ; label = what RET reads: region / gptel response / Org subtree / page / buffer to point / whole buffer / nothing
  ["Output >" s Speakers, append (default)  S Speakers, interrupt  f Save to file  c Cache only]
  ["Playback" :if utter-active-p            ; every suffix :transient t
              SPC Pause/resume  n Next utterance  p Previous utterance  +/_ Rate  x Clear pending  q Stop all  Q Queue buffer]
@@ -343,9 +345,12 @@ other `:foo` → `utter-foo`. `(utter-get-preset NAME)`,
 - Voices are fetched only when the voice infix opens; cached one day.
 - Oneshot scope covers one utterance.
 - Highlight follows the playing text, not the synthesizing one.
-- `utter-speak` with no region reads a thing at point only when a
-  `utter-thing-at-point-functions` entry claims point; else the sentence.
-  Never the whole buffer implicitly.
+- `utter-speak` with no region (decided 2026-09-28, matching gptel): a
+  source from `utter-input-functions` may claim point (gptel response, Org
+  subtree, page); else the buffer from its start to point, or the whole
+  buffer when nothing precedes point.  The menu exposes no per-source
+  switches, only the label of what RET will read plus the minibuffer and
+  kill-ring overrides.  Blank input errors name the source.
 - Cache pruned at 500 MB by atime.
 - Multi-segment save-to-file is post-MVP.
 

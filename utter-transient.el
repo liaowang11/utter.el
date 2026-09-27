@@ -47,7 +47,6 @@
 (declare-function utter-enqueue "utter" (text &rest params))
 (declare-function utter-interrupt "utter" (text &rest params))
 (declare-function utter-save-to-file "utter" (text file))
-(declare-function utter--text-at-point "utter" (&optional arg))
 (declare-function utter--set-with-scope "utter" (sym value &optional scope))
 (declare-function utter-get-preset "utter" (name))
 (declare-function utter--apply-preset "utter" (preset &optional setter))
@@ -479,53 +478,38 @@ backend, then redraw the menu."
 
 ;;;; Input and output
 
-(defun utter-transient--buffer-input (text)
-  "Return (TEXT . PARAMS) for TEXT taken from the current buffer."
-  (list text :source-buffer (current-buffer) :source-name (buffer-name)))
-
 (defun utter-transient--default-input ()
   "Return (TEXT . PARAMS) chosen the way `utter-speak' chooses.
-Uses the engine's `utter--text-at-point' when defined, else the
-region or the sentence at point."
-  (if (fboundp 'utter--text-at-point)
-      (pcase-let ((`(,text . ,name) (utter--text-at-point)))
-        (list text :source-buffer (current-buffer)
-              :source-name (or name (buffer-name))))
-    (utter-transient--buffer-input
-     (if (use-region-p)
-         (buffer-substring-no-properties (region-beginning) (region-end))
-       (or (thing-at-point 'sentence t) "")))))
-
-(defun utter-transient--org-subtree ()
-  "Return the text of the Org subtree at point."
-  (unless (derived-mode-p 'org-mode)
-    (user-error "Not an Org buffer"))
-  (save-excursion
-    (org-back-to-heading t)
-    (let ((start (point)))
-      (org-end-of-subtree t t)
-      (buffer-substring-no-properties start (point)))))
+The active region, else a source from `utter-input-functions', else
+the buffer up to point; see `utter--text-at-point'."
+  (pcase-let ((`(,text . ,name) (utter--text-at-point)))
+    (list text :source-buffer (current-buffer)
+          :source-name (or name (buffer-name)))))
 
 (defun utter-transient--input (args)
-  "Return (TEXT . PARAMS) for the input switch in ARGS."
+  "Return (TEXT . PARAMS) for the input switch in ARGS.
+Without a switch the text is chosen like `utter-speak' does."
   (cond
-   ((member "b" args)
-    (utter-transient--buffer-input
-     (buffer-substring-no-properties (point) (point-max))))
-   ((member "o" args)
-    (utter-transient--buffer-input (utter-transient--org-subtree)))
-   ((member "e" args)
-    (utter-transient--buffer-input
-     (buffer-substring-no-properties (point-min) (point-max))))
    ((member "y" args)
-    (list (substring-no-properties (current-kill 0)) :source-name "kill-ring"))
+    (let ((text (and (or kill-ring interprogram-paste-function)
+                     (substring-no-properties (current-kill 0)))))
+      (when (or (null text) (string-blank-p text))
+        (user-error "Nothing to read aloud: the kill ring is empty"))
+      (list text :source-name "kill-ring")))
    ((member "m" args)
-    (list (read-string "Text to read aloud: ") :source-name "minibuffer"))
-   ((member "t" args)
-    (let ((value (eval (read--expression "Read aloud the value of: ") t)))
-      (list (if (stringp value) value (format "%s" value))
-            :source-name "Lisp")))
+    (let ((text (read-string "Text to read aloud: ")))
+      (when (string-blank-p text)
+        (user-error "Nothing to read aloud: the minibuffer input is blank"))
+      (list text :source-name "minibuffer")))
    (t (utter-transient--default-input))))
+
+(defun utter-transient--input-description ()
+  "Describe the Input group with the source RET would read."
+  (format "Input < %s"
+          (with-current-buffer (if (buffer-live-p transient--original-buffer)
+                                   transient--original-buffer
+                                 (current-buffer))
+            (utter-input-label))))
 
 (defun utter-transient--describe-speak ()
   "Describe the RET suffix, with the queue position while playing."
@@ -637,7 +621,7 @@ Playback column."
 (transient-define-prefix utter-menu ()
   "Read text aloud: settings, input, output and playback control."
   :refresh-suffixes t
-  :incompatible '(("r" "b" "o" "e" "y" "m" "t") ("s" "S" "f" "c"))
+  :incompatible '(("m" "y") ("s" "S" "f" "c"))
   [:description utter--menu-heading
    ["Backend"
     (utter--infix-provider)
@@ -649,14 +633,11 @@ Playback column."
     (utter--infix-highlight)
     (utter--infix-scope)
     (utter--infix-preset)]
-   ["Input <"
-    ("r" "Region (default)" "r")
-    ("b" "Buffer from point" "b")
-    ("o" "Org subtree" "o")
-    ("e" "EWW / Info page" "e")
-    ("y" "Kill-ring" "y")
-    ("m" "Minibuffer" "m")
-    ("t" "String from Lisp" "t")]
+   ;; What RET reads is a heuristic (region, else a claimed source, else
+   ;; the buffer to point) shown in the heading; only overrides are keys.
+   [:description utter-transient--input-description
+    ("m" "Minibuffer instead" "m")
+    ("y" "Kill-ring instead" "y")]
    ["Output >"
     ("s" "Speakers, append (default)" "s")
     ("S" "Speakers, interrupt" "S")
