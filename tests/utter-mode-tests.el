@@ -224,7 +224,10 @@ Recorded calls end up in `utter-ui-test--calls'."
       (should (memq #'utter-mode--refresh utter-progress-functions))
       (should (memq #'utter-mode--refresh utter-item-finished-functions))
       (utter-mode -1)
-      (should-not (memq #'utter-mode--refresh utter-progress-functions)))))
+      (should-not (memq #'utter-mode--refresh utter-progress-functions)))
+    (with-temp-buffer
+      (utter-mode 1))                   ; killed while the mode is on
+    (should-not (memq #'utter-mode--refresh utter-progress-functions))))
 
 (defun utter-ui-test--binding (key read-only)
   "Return the command KEY runs under `utter-mode' with READ-ONLY."

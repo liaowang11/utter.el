@@ -224,11 +224,18 @@ buffers they follow the prefix \\<utter-mode-map>\\[utter-mode-command-map].
         (unless (equal header-line-format utter-mode--header-line-format)
           (setq utter-mode--saved-header-line header-line-format))
         (setq header-line-format utter-mode--header-line-format)
+        (add-hook 'kill-buffer-hook #'utter-mode--on-kill nil t)
         (utter-mode--add-hooks))
     (when (equal header-line-format utter-mode--header-line-format)
       (setq header-line-format utter-mode--saved-header-line))
     (kill-local-variable 'utter-mode--saved-header-line)
+    (remove-hook 'kill-buffer-hook #'utter-mode--on-kill t)
     (utter-mode--remove-hooks-if-unused)))
+
+(defun utter-mode--on-kill ()
+  "Drop the engine hooks when the last `utter-mode' buffer is killed."
+  (setq utter-mode nil)
+  (utter-mode--remove-hooks-if-unused))
 
 ;;;; Queue buffer
 
