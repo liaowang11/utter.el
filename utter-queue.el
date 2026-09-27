@@ -189,6 +189,20 @@ PAUSE, RESUME and STOP are functions of the player process."
   "Resume PROCESS with SIGCONT."
   (signal-process process 'SIGCONT))
 
+(defun utter-player-restart (process)
+  "Resume the paused player PROCESS by starting it again where it stopped.
+For players that lose their place under SIGSTOP, such as ffplay.
+The player's command must accept a third argument, the offset in
+seconds of audio.  Return the new process."
+  (let* ((player (process-get process 'utter-player))
+         (seg (process-get process 'utter-segment))
+         (argv (funcall (utter-player-command player) (utter--segment-file seg)
+                        (process-get process 'utter-rate)
+                        (process-get process 'utter-offset))))
+    (process-put process 'utter-stopped t)
+    (delete-process process)
+    (utter--start-player-process argv player seg (process-get process 'utter-rate))))
+
 (defun utter--rate-string (rate)
   "Return RATE as a short decimal string."
   (number-to-string (/ (round (* rate 100)) 100.0)))
@@ -203,9 +217,13 @@ PAUSE, RESUME and STOP are functions of the player process."
 (defvar utter-player-ffplay
   (make-utter-player
    :name "ffplay" :formats '(mp3 wav aiff m4a aac flac opus ogg)
-   :command (lambda (file rate)
-              (list "ffplay" "-nodisp" "-autoexit" "-loglevel" "error"
-                    "-af" (concat "atempo=" (utter--rate-string rate)) file)))
+   ;; ffplay keeps its wall clock under SIGSTOP and skips the paused
+   ;; stretch on SIGCONT, so resume restarts it at the paused offset.
+   :resume #'utter-player-restart
+   :command (lambda (file rate &optional offset)
+              (append (list "ffplay" "-nodisp" "-autoexit" "-loglevel" "error")
+                      (and offset (list "-ss" (format "%.2f" offset)))
+                      (list "-af" (concat "atempo=" (utter--rate-string rate)) file))))
   "The ffplay player from FFmpeg.")
 
 (defvar utter-player-mpv
@@ -797,20 +815,16 @@ Other utterances stay; a message says why."
          (argv (and player
                     (funcall (utter-player-command player) (utter--segment-file seg)
                              (default-value 'utter-playback-rate))))
+         (rate (default-value 'utter-playback-rate))
          (proc (and argv
                     (condition-case err
-                        (make-process :name "utter-player" :command argv
-                                      :buffer nil :noquery t
-                                      :connection-type 'pipe
-                                      :sentinel #'utter--player-sentinel)
+                        (utter--start-player-process argv player seg rate)
                       (error (utter--segment-failed
                               item seg (format "cannot start player: %s"
                                                (error-message-string err)))
                              nil)))))
     (cond
      (proc
-      (process-put proc 'utter-player player)
-      (process-put proc 'utter-segment seg)
       (setf (utter--segment-status seg) 'playing
             (utter--qstate-process q) proc
             (utter--qstate-seg-start q) (float-time)
@@ -827,6 +841,17 @@ Other utterances stay; a message says why."
       (utter--segment-failed
        item seg (format "no player for %s audio; install ffplay or mpv, or set `utter-player'"
                         (or (utter--segment-format seg) "this")))))
+    proc))
+
+(defun utter--start-player-process (argv player seg rate)
+  "Start ARGV as the process of PLAYER playing SEG at RATE."
+  (let ((proc (make-process :name "utter-player" :command argv
+                            :buffer nil :noquery t
+                            :connection-type 'pipe
+                            :sentinel #'utter--player-sentinel)))
+    (process-put proc 'utter-player player)
+    (process-put proc 'utter-segment seg)
+    (process-put proc 'utter-rate rate)
     proc))
 
 (defun utter--player-sentinel (proc _event)
@@ -1025,7 +1050,11 @@ stay listed and can be replayed.  PARAMS are as for
       (when-let* ((proc (utter--qstate-process q)))
         (process-put proc 'utter-was-paused t)
         (funcall (utter-player-pause (process-get proc 'utter-player)) proc)
-        (setf (utter--qstate-pause-start q) (float-time)))
+        (setf (utter--qstate-pause-start q) (float-time))
+        ;; Audio position, for players that resume by restarting.
+        (process-put proc 'utter-offset
+                     (* (- (utter--elapsed) (utter--qstate-played q))
+                        (or (process-get proc 'utter-rate) 1.0))))
       (setf (utter-item-status (utter--qstate-current q)) 'paused)
       (message "utter: paused")
       (utter--changed))))
@@ -1039,7 +1068,11 @@ stay listed and can be replayed.  PARAMS are as for
     (when (utter--qstate-paused q)
       (setf (utter--qstate-paused q) nil)
       (when-let* ((proc (utter--qstate-process q)))
-        (funcall (utter-player-resume (process-get proc 'utter-player)) proc)
+        (let ((new (funcall (utter-player-resume (process-get proc 'utter-player))
+                            proc)))
+          (when (and (processp new) (not (eq new proc)))
+            (process-put new 'utter-was-paused t)
+            (setf (utter--qstate-process q) new)))
         (when (utter--qstate-pause-start q)
           (cl-incf (utter--qstate-paused-total q)
                    (- (float-time) (utter--qstate-pause-start q))))

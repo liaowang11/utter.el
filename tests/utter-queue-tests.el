@@ -430,6 +430,45 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
         (should (utter-eng--wait #'utter-eng--idle-p))
         (should (eq (utter-item-status item) 'done))))))
 
+(ert-deftest utter-queue-restart-resume-continues-at-offset ()
+  ;; Players that lose their place under SIGSTOP (ffplay) resume by
+  ;; starting again at the paused position.
+  (let* ((starts nil)
+         (player (make-utter-player
+                  :name "restarting" :formats '(wav)
+                  :resume #'utter-player-restart
+                  :command (lambda (_file rate &optional offset)
+                             (push (list rate offset) starts)
+                             (list "sleep" (if offset "0.2" "0.4"))))))
+    (utter-eng-with-queue ((utter-player player) (utter-playback-rate 1.5)
+                           (finished 0))
+      (add-hook 'utter-item-finished-functions
+                (lambda (_i _s) (setq finished (1+ finished))))
+      (let ((item (utter-enqueue "Restart me.")))
+        (should (utter-eng--wait (lambda () (eq (utter-eng--status) 'playing))))
+        (utter-eng--wait #'ignore 0.15)
+        (let ((first (utter--qstate-process utter--queue)))
+          (utter-pause)
+          (utter-eng--wait #'ignore 0.3)
+          (utter-resume)
+          (should-not (process-live-p first))
+          (should (process-live-p (utter--qstate-process utter--queue))))
+        (should (= (length starts) 2))
+        (let ((offset (cadr (car starts))))
+          ;; About 0.15 s played at rate 1.5, so about 0.22 s of audio.
+          (should (and (numberp offset) (< 0.1 offset 0.5))))
+        (should (equal (car (car starts)) 1.5))
+        (should (utter-eng--wait #'utter-eng--idle-p))
+        (should (eq (utter-item-status item) 'done))
+        (should (= finished 1))))))
+
+(ert-deftest utter-queue-ffplay-restarts-with-seek ()
+  (should (eq (utter-player-resume utter-player-ffplay) #'utter-player-restart))
+  (should (equal (funcall (utter-player-command utter-player-ffplay) "/a.mp3" 1.0 2.5)
+                 '("ffplay" "-nodisp" "-autoexit" "-loglevel" "error"
+                   "-ss" "2.50" "-af" "atempo=1.0" "/a.mp3")))
+  (should (eq (utter-player-resume utter-player-afplay) #'utter-player-sigcont)))
+
 (ert-deftest utter-queue-pause-before-audio-holds-playback ()
   (utter-eng-with-queue ((utter-eng--auto nil))
     (utter-enqueue "Wait.")
@@ -629,7 +668,7 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
   (should (equal (funcall (utter-player-command utter-player-mpv) "/a.mp3" 1.2)
                  '("mpv" "--no-video" "--speed=1.2" "/a.mp3")))
   (should (eq (utter-player-pause utter-player-afplay) #'utter-player-sigstop))
-  (should (eq (utter-player-resume utter-player-ffplay) #'utter-player-sigcont)))
+  (should (eq (utter-player-pause utter-player-ffplay) #'utter-player-sigstop)))
 
 (ert-deftest utter-queue-auto-player-picks-installed-and-format ()
   (let* ((missing (make-utter-player :name "missing" :formats '(wav)
