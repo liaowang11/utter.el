@@ -382,6 +382,11 @@ Real-server checks (2026-09-27, batch Emacs, keys from `pass`):
   clear message otherwise); with `:format pcm` core wrapped the PCM into a
   7.3 s WAV that afplay played. Deepgram `flux-tts:free` needs its own voice
   names (`flux-*-en`), so per-model voice lists matter.
+- Gemini native `/v1beta/interactions` with the key from `pass`
+  (`generativelanguage.googleapis.com/apikey`, the host/user layout
+  auth-source-pass resolves by default): 200, base64 WAV decoded, 5.8 s
+  played. Body shape `input[user_input] / response_format audio /
+  generation_config.speech_config[voice]` accepted as sent.
 - Menu opened against the real engine in batch; `utter--suffix-speak nil`
   spoke the sentence at point; heading rendered live state; three-utterance
   run exercised prefetch, pause/resume (SIGSTOP), `utter-next`, lighter
