@@ -1,3 +1,5 @@
 *.elc
 /reports/*.tmp
 .agent-shell/
+/.eask
+/tmp/
