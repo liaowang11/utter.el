@@ -801,13 +801,11 @@ current value."
   "Return non-nil if NUMBER is a finite real number."
   (and (numberp number)
        (or (integerp number)
-           (condition-case nil
-               (progn (truncate number) t)
-             (error nil)))))
+           (and (= number number) (< (abs number) 1.0e+INF)))))
 
 (defun utter--alignment-array-list (array)
   "Return ARRAY as a list when it is a JSON array, or nil otherwise."
-  (cond ((and (vectorp array) (not (stringp array))) (append array nil))
+  (cond ((vectorp array) (append array nil))
         ((listp array) array)))
 
 (defun utter--normalize-alignment (text characters starts ends)
@@ -825,13 +823,12 @@ than its end."
                    (cl-every (lambda (char) (and (stringp char) (= (length char) 1)))
                              char-array))
               (mapconcat #'identity char-array ""))))
-           (start-vector (cond ((and (vectorp starts) (not (stringp starts))) starts)
+           (start-vector (cond ((vectorp starts) starts)
                                ((listp starts) (vconcat starts))))
-           (end-vector (cond ((and (vectorp ends) (not (stringp ends))) ends)
+           (end-vector (cond ((vectorp ends) ends)
                              ((listp ends) (vconcat ends)))))
       (when (and (stringp character-string)
                  (equal character-string text)
-                 (= (length character-string) (length text))
                  start-vector end-vector
                  (> (length text) 0)
                  (= (length start-vector) (length text))

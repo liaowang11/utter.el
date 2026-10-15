@@ -720,5 +720,10 @@ PATH is matched without the query string.")
     (setf (utter-backend-voices b) 'fetch)
     (should-error (utter--list-voices (utter--make-backend :name "F" :voices 'fetch) #'ignore))))
 
+(ert-deftest utter-core-test-finite-number-p ()
+  (should (cl-every #'utter--finite-number-p '(0 1 1.5 -0.0)))
+  (should-not (cl-some #'utter--finite-number-p
+                       (list 1.0e+INF -1.0e+INF 0.0e+NaN "1" nil))))
+
 (provide 'utter-core-tests)
 ;;; utter-core-tests.el ends here

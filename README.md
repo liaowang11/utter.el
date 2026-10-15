@@ -190,7 +190,8 @@ With **Highlight spoken text** enabled, xAI and ElevenLabs use returned
 character timestamps to highlight the current sentence, independently of
 request-sized pieces. Timings are cached alongside the audio and removed
 by cache clear/prune. Old audio-only cache entries for these backends are
-not reused, so the first repeat after upgrading makes a new request.
+not reused, so the first repeat after upgrading makes a new request; they
+stay on disk until `utter-cache-prune` or `utter-cache-clear` removes them.
 These backends always request timing metadata; xAI's alignment pass can add
 synthesis latency. Gemini and other backends without usable timing data
 continue to highlight the playing piece. Missing, malformed or mismatched

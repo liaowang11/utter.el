@@ -774,7 +774,9 @@ Use the player's captured rate and exclude paused wall time."
                                       (file-name-extension audio)))
             (utter--segment-duration seg) (plist-get info :duration)
             (utter--segment-cues seg)
-            (utter--sentence-cues item seg (plist-get info :alignment))
+            (condition-case nil
+                (utter--sentence-cues item seg (plist-get info :alignment))
+              (error nil))
             (utter--segment-status seg) 'ready))
      ((eq audio 'abort)
       (utter--segment-failed item seg "request aborted"))
@@ -1144,6 +1146,7 @@ stay listed and can be replayed.  PARAMS are as for
       (setf (utter--qstate-paused q) t)
       (when-let* ((proc (utter--qstate-process q)))
         (process-put proc 'utter-was-paused t)
+        (utter--progress-stop proc)
         (funcall (utter-player-pause (process-get proc 'utter-player)) proc)
         (setf (utter--qstate-pause-start q) (float-time))
         ;; Audio position, for players that resume by restarting.

@@ -761,9 +761,13 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
                                         (overlay-end utter--highlight-overlay))
                        "Hello Bill. "))
         (utter-pause)
+        (should-not (process-get (utter--qstate-process utter--queue)
+                                 'utter-progress-timer))
         (sleep-for 0.4)
         (should (= (overlay-start utter--highlight-overlay) 1))
         (utter-resume)
+        (should (process-get (utter--qstate-process utter--queue)
+                             'utter-progress-timer))
         (should (utter-eng--wait
                  (lambda () (= (overlay-start utter--highlight-overlay) 13)) 0.55))
         (should (equal (buffer-substring (overlay-start utter--highlight-overlay)
@@ -813,6 +817,29 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
             (should-not (process-get proc 'utter-progress-timer))
             (should-not (memq timer timer-list))
             (should-not utter--highlight-overlay)))))))
+
+(ert-deftest utter-queue-highlight-cue-error-still-plays ()
+  (utter-eng-with-queue ((utter-highlight t)
+                         (utter-eng--auto nil))
+    (utter-eng-with-source "Hello Bill. This is a timing test."
+      (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                 :source-buffer (current-buffer)))
+             (text (utter-item-text item))
+             (seg (car (utter--item-segments item)))
+             (req (car utter-eng--requests)))
+        (cl-letf (((symbol-function 'utter--sentence-cues)
+                   (lambda (&rest _) (error "Boom"))))
+          (funcall (utter-eng-req-callback req) utter-eng--audio-file
+                   (list :format 'wav :alignment
+                         (list :characters text
+                               :starts (make-vector (length text) 0.0)
+                               :ends (make-vector (length text) 1.0)))))
+        (should (memq (utter--segment-status seg) '(ready playing)))
+        (should-not (utter--segment-cues seg))
+        (should (equal (buffer-substring (overlay-start utter--highlight-overlay)
+                                        (overlay-end utter--highlight-overlay))
+                       "Hello Bill. This is a timing test."))
+        (utter-stop)))))
 
 (ert-deftest utter-queue-highlight-off-by-default ()
   (utter-eng-with-queue ()
