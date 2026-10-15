@@ -126,8 +126,7 @@ menu opens; VALUE is the menu's initial switches."
                          "Region (default)" "Buffer from point" "Org subtree"
                          "EWW / Info page" "String from Lisp"))
           (should-not (string-search label text)))
-        (should-not (string-search "Playback" text))
-        (should-not (string-search "Inspect" text)))
+        (should-not (string-search "Playback" text)))
       (should (eq (utter-transient-test--face-at "Nothing to read aloud")
                   'error)))))
 

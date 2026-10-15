@@ -16,8 +16,9 @@
 
 ;; A backend for ElevenLabs text to speech:
 ;;
-;;   POST https://api.elevenlabs.io/v1/text-to-speech/VOICE_ID?output_format=mp3_44100_128
+;;   POST https://api.elevenlabs.io/v1/text-to-speech/VOICE_ID/with-timestamps?output_format=mp3_44100_128
 ;;   xi-api-key: KEY
+;;   -> JSON with base64 audio and character_start_times_seconds / character_end_times_seconds.
 ;;   {"text", "model_id", "voice_settings": {"speed"}, "previous_text", "next_text"}
 ;;
 ;; The key comes from auth-source by default:
@@ -55,7 +56,7 @@
 
 (defun utter-elevenlabs--url (backend info)
   "Return the synthesis URL for BACKEND and request INFO."
-  (format "%s://%s/v1/text-to-speech/%s?output_format=%s"
+  (format "%s://%s/v1/text-to-speech/%s/with-timestamps?output_format=%s"
           (or (utter-backend-protocol backend) "https")
           (utter-backend-host backend)
           (url-hexify-string (or (plist-get info :voice-id) utter-elevenlabs-default-voice-id))
@@ -77,7 +78,8 @@ model ids; the first is the default."
         (utter--make-elevenlabs
          :name name :host host :protocol "https" :key key
          :models models :formats '(mp3 pcm) :max-chars 5000
-         :response-kind 'bytes :capabilities '(stitching)
+         :response-kind 'b64-json :response-path '(audio_base64)
+         :capabilities '(stitching timestamps)
          :curl-args curl-args :request-params request-params
          :voices 'fetch
          :header #'utter-elevenlabs--header
@@ -114,6 +116,17 @@ taken as an id.  nil gives `utter-elevenlabs-default-voice-id'."
        (list :language_code (if (symbolp lang) (symbol-name lang) lang)))
      (when-let* ((p (plist-get ctx :previous))) (list :previous_text p))
      (when-let* ((n (plist-get ctx :next))) (list :next_text n)))))
+
+(cl-defmethod utter--response-alignment ((_backend utter-elevenlabs) info json)
+  "Normalize original ElevenLabs alignment from JSON for request INFO."
+  (let* ((alignment (alist-get 'alignment json))
+         (characters (and alignment
+                          (utter--alignment-array-list
+                           (alist-get 'characters alignment))))
+         (starts (and alignment (alist-get 'character_start_times_seconds alignment)))
+         (ends (and alignment (alist-get 'character_end_times_seconds alignment))))
+    (when characters
+      (utter--normalize-alignment (plist-get info :text) characters starts ends))))
 
 (cl-defmethod utter--list-voices ((backend utter-elevenlabs) callback)
   "Fetch BACKEND's voices from GET /v2/voices and call CALLBACK.

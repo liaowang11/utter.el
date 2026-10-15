@@ -113,36 +113,46 @@
   (should (equal (utter--split "Hello world. How are you?" 4096)
                  '("Hello world. How are you?"))))
 
-(ert-deftest utter-text-split-english-packs-sentences ()
-  (let* ((utter--first-segment-chars 30)
-         (text "One two three. Four five six. Seven eight nine. Ten eleven twelve. Thirteen fourteen.")
-         (segs (utter--split text 40)))
-    (should (equal segs '("One two three. Four five six."
-                          "Seven eight nine. Ten eleven twelve."
-                          "Thirteen fourteen.")))
-    (dolist (s segs) (should (<= (length s) 40)))))
-
-(ert-deftest utter-text-split-first-segment-is-short ()
-  (let* ((sentence "This sentence has exactly fifty characters in it. ")
-         (text (apply #'concat (make-list 40 sentence)))
-         (segs (utter--split text 4096)))
-    (should (<= (length (car segs)) utter--first-segment-chars))
-    (should (> (length segs) 1))
+(ert-deftest utter-text-split-title-then-long-body-grows-gradually ()
+  (let* ((utter--first-segment-chars 200)
+         (sentence (concat "Body " (make-string 240 ?x) ". "))
+         (text (concat "Title. " (apply #'concat (make-list 200 sentence))))
+         (segs (utter--split text 4096))
+         (sizes (mapcar #'length segs)))
+    (should (equal (car segs) "Title."))
+    (should (<= (nth 1 sizes) 400))
+    (should (> (length segs) 6))
+    ;; The soft target expands 200, 400, 800, 1600, 3200, then
+    ;; reaches the backend cap, so later chunks grow gradually.
+    (should (< (nth 0 sizes) (nth 1 sizes)))
+    (should (< (nth 1 sizes) (nth 2 sizes)))
+    (should (< (nth 2 sizes) (nth 3 sizes)))
+    (should (< (nth 3 sizes) (nth 4 sizes)))
+    (should (< (nth 4 sizes) (nth 5 sizes)))
+    (should (<= (nth 5 sizes) 4096))
     (should (equal (utter-text-tests--squash (apply #'concat segs))
                    (utter-text-tests--squash text)))))
 
-(ert-deftest utter-text-split-chinese ()
+(ert-deftest utter-text-split-keeps-sentence-over-soft-target ()
+  (let ((utter--first-segment-chars 10)
+        (text "This whole sentence is longer than ten characters."))
+    (should (equal (utter--split text 100) (list text)))))
+
+(ert-deftest utter-text-split-chinese-conserves-sentences ()
   (let* ((utter--first-segment-chars 10)
          (text "今天天气很好。我们去公园吧！你想去吗？好的；走吧。")
          (segs (utter--split text 12)))
-    (should (equal segs '("今天天气很好。" "我们去公园吧！你想去吗？" "好的；走吧。")))))
+    (dolist (s segs)
+      (should (<= (length s) 12))
+      (should (string-match-p "[。！？；]\\'" s)))
+    (should (equal (utter-text-tests--squash (apply #'concat segs))
+                   (utter-text-tests--squash text)))))
 
-(ert-deftest utter-text-split-mixed ()
+(ert-deftest utter-text-split-mixed-conserves-text ()
   (let* ((utter--first-segment-chars 20)
          (text "Emacs 很好用。It is extensible. 我喜欢它！Really.")
          (segs (utter--split text 25)))
     (dolist (s segs) (should (<= (length s) 25)))
-    (should (equal (car segs) "Emacs 很好用。"))
     (should (equal (utter-text-tests--squash (apply #'concat segs))
                    (utter-text-tests--squash text)))))
 
@@ -175,8 +185,11 @@
     (dolist (s segs) (should (<= (length s) 4096)))
     (should (equal (apply #'concat segs) text))))
 
-(ert-deftest utter-text-split-units ()
-  (let ((text (apply #'concat (make-list 50 "你好世界。"))))
+(ert-deftest utter-text-split-hard-unit-boundaries ()
+  ;; A single unbroken sentence forces hard splits, independently of
+  ;; sentence packing.  Astral characters distinguish all three units.
+  (let ((utter--first-segment-chars 200)
+        (text (make-string 80 #x1f600)))
     (dolist (unit '(chars bytes utf16))
       (let ((segs (utter--split text 60 unit)))
         (dolist (s segs)
@@ -212,9 +225,12 @@
       (should-not (string-match-p "\\`[^<]*>" s)))))
 
 (ert-deftest utter-text-split-plain-less-than-is-not-ssml ()
-  (let ((utter--first-segment-chars 10))
-    (should (equal (utter--split "If a < b. Then c > d." 12)
-                   '("If a < b." "Then c > d.")))))
+  (let* ((utter--first-segment-chars 10)
+         (text "If a < b. Then c > d.")
+         (segs (utter--split text 12)))
+    (should-not (utter--ssml-forbidden text))
+    (should (equal (utter-text-tests--squash (apply #'concat segs))
+                   (utter-text-tests--squash text)))))
 
 (ert-deftest utter-text-split-functions-hook ()
   (let ((utter--split-functions

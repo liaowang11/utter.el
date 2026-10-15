@@ -34,11 +34,12 @@
                    '(("Content-Type" . "application/json") ("Authorization" . "[redacted]"))))
     (should (equal (plist-get d :body)
                    '(:text "Hello" :voice_id "atlas" :language "en"
-                     :output_format (:codec "mp3"))))
+                     :output_format (:codec "mp3") :with_timestamps t)))
     (should-not (string-search "x-secret" (format "%S" d)))
     ;; Default voice, wav codec, explicit language string.
     (should (equal (plist-get (utter-request "Hi" :backend b :format 'wav :language "fr" :dry-run t) :body)
-                   '(:text "Hi" :voice_id "eve" :language "fr" :output_format (:codec "wav"))))))
+                   '(:text "Hi" :voice_id "eve" :language "fr"
+                     :output_format (:codec "wav") :with_timestamps t)))))
 
 (ert-deftest utter-xai-test-language-auto ()
   (let ((b (utter-make-xai "xAI-lang" :key "k")))
@@ -81,20 +82,78 @@
 
 (ert-deftest utter-xai-test-request ()
   (skip-unless (executable-find "curl"))
-  (utter-test-with-server `(("/v1/tts" 200 "audio/mpeg" ,utter-test-mp3))
-    (let* ((b (utter-make-xai "xAI-req" :key "x-live")))
-      (setf (utter-backend-protocol b) "http" (utter-backend-host b) host)
-      (let* ((res (utter-test-request "你好" :backend b :cache nil))
-             (sreq (car utter-test-requests))
-             (json (json-parse-string (plist-get sreq :body) :object-type 'plist)))
-        (should (car res))
-        (should (equal (utter-test-file-bytes (car res)) utter-test-mp3))
-        (should (equal (plist-get sreq :path) "/v1/tts"))
-        (should (equal (cdr (assoc "authorization" (plist-get sreq :headers))) "Bearer x-live"))
-        (should (equal (plist-get json :text) "你好"))
-        (should (equal (plist-get json :voice_id) "eve"))
-        (should (equal (plist-get json :language) "zh"))
-        (delete-file (car res))))))
+  (let ((body (json-serialize
+               (list :audio (base64-encode-string utter-test-mp3 t)
+                     :content_type "audio/mpeg" :duration 2.87
+                     :audio_timestamps
+                     (list :graph_chars ["H" "i"]
+                           :graph_times [[0 1.1] [1.1 2.87]])))))
+    (utter-test-with-server `(("/v1/tts" 200 "application/json" ,body))
+      (let* ((b (utter-make-xai "xAI-req" :key "x-live")))
+        (setf (utter-backend-protocol b) "http" (utter-backend-host b) host)
+        (let* ((res (utter-test-request "Hi" :backend b :cache nil))
+               (sreq (car utter-test-requests))
+               (json (json-parse-string (plist-get sreq :body) :object-type 'plist))
+               (alignment (plist-get (cadr res) :alignment)))
+          (should (car res))
+          (should (equal (utter-test-file-bytes (car res)) utter-test-mp3))
+          (should (equal (plist-get sreq :path) "/v1/tts"))
+          (should (equal (cdr (assoc "authorization" (plist-get sreq :headers))) "Bearer x-live"))
+          (should (equal (plist-get json :text) "Hi"))
+          (should (equal (plist-get json :voice_id) "eve"))
+          (should (equal (plist-get json :language) "en"))
+          (should (eq (plist-get json :with_timestamps) t))
+          (should (equal alignment '(:characters "Hi" :starts [0 1.1] :ends [1.1 2.87])))
+          (delete-file (car res)))))))
+
+(ert-deftest utter-xai-test-cache-alignment-and-legacy-audio-miss ()
+  (skip-unless (executable-find "curl"))
+  (let ((body (json-serialize
+               (list :audio (base64-encode-string utter-test-mp3 t)
+                     :content_type "audio/mpeg" :duration 2.87
+                     :audio_timestamps
+                     (list :graph_chars ["H" "i"]
+                           :graph_times [[0 1.1] [1.1 2.87]])))))
+    (utter-test-with-temp-dir dir
+      (let* ((utter-cache-directory dir)
+             (legacy-key (utter-cache-key
+                          (utter--make-backend :name "xAI-cache")
+                          '(:model grok-tts :speed 1.0 :format mp3) "Hi"))
+             (legacy-file (utter-cache-file legacy-key 'mp3)))
+        (utter-test-write-bytes legacy-file utter-test-mp3)
+        (utter-test-with-server `(("/v1/tts" 200 "application/json" ,body))
+          (let ((b (utter-make-xai "xAI-cache" :key "k")))
+            (setf (utter-backend-protocol b) "http" (utter-backend-host b) host)
+            (let* ((first (utter-test-request "Hi" :backend b))
+                   (second (utter-test-request "Hi" :backend b))
+                   (sidecar (utter-cache-alignment-file (file-name-base (car first))))
+                   (expected '(:characters "Hi" :starts [0 1.1] :ends [1.1 2.87])))
+              (should (car first))
+              (should-not (plist-get (cadr first) :cached))
+              (should (equal (plist-get (cadr first) :alignment) expected))
+              (should (plist-get (cadr second) :cached))
+              (should (equal (plist-get (cadr second) :alignment) expected))
+              (should (= (length utter-test-requests) 1))
+              (should (file-exists-p sidecar))
+              (utter-cache-clear)
+              (should-not (file-exists-p sidecar)))))))))
+
+(ert-deftest utter-xai-test-malformed-alignment-falls-back ()
+  (skip-unless (executable-find "curl"))
+  (let ((body (json-serialize
+               (list :audio (base64-encode-string utter-test-mp3 t)
+                     :content_type "audio/mpeg"
+                     :audio_timestamps
+                     (list :graph_chars ["H" "o"]
+                           :graph_times [[0 0.5] [0.5 1.0]])))))
+    (utter-test-with-server `(("/v1/tts" 200 "application/json" ,body))
+      (let ((b (utter-make-xai "xAI-malformed" :key "k")))
+        (setf (utter-backend-protocol b) "http" (utter-backend-host b) host)
+        (let ((res (utter-test-request "Hi" :backend b :cache nil)))
+          (should (car res))
+          (should (equal (utter-test-file-bytes (car res)) utter-test-mp3))
+          (should-not (plist-get (cadr res) :alignment))
+          (delete-file (car res)))))))
 
 (ert-deftest utter-xai-test-error ()
   (skip-unless (executable-find "curl"))

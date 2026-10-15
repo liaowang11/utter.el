@@ -16,8 +16,8 @@
 ;;
 ;;   POST https://api.x.ai/v1/tts        Authorization: Bearer KEY
 ;;   {"text": ..., "voice_id": "eve", "language": "en",
-;;    "output_format": {"codec": "mp3" | "wav"}}
-;;   -> raw audio bytes (audio/mpeg or audio/wav)
+;;    "output_format": {"codec": "mp3" | "wav"}, "with_timestamps": true}
+;;   -> JSON with base64 audio and per-character audio_timestamps.
 ;;
 ;;   GET https://api.x.ai/v1/tts/voices
 ;;   -> {"voices": [{"voice_id", "name", "language", "gender"}, ...]}
@@ -52,7 +52,8 @@ MAX-CHARS bounds one request; xAI documents no limit."
         (utter--make-xai
          :name name :host host :protocol "https" :endpoint "/v1/tts" :key key
          :models '(grok-tts) :formats '(mp3 wav) :max-chars max-chars
-         :response-kind 'bytes :capabilities nil
+         :response-kind 'b64-json :response-path '(audio)
+         :capabilities '(timestamps)
          :curl-args curl-args :request-params request-params
          :voices 'fetch
          :header #'utter-bearer-header)))
@@ -83,7 +84,26 @@ taken as an id.  nil gives `utter-xai-default-voice-id'."
           :language (cond ((or (null lang) (eq lang 'auto)) (utter-xai--guess-language text))
                           ((symbolp lang) (symbol-name lang))
                           (t lang))
-          :output_format (list :codec (if (eq format 'wav) "wav" "mp3")))))
+          :output_format (list :codec (if (eq format 'wav) "wav" "mp3"))
+          :with_timestamps t)))
+
+(cl-defmethod utter--response-alignment ((_backend utter-xai) info json)
+  "Normalize xAI audio_timestamps from JSON for request INFO."
+  (let* ((timestamps (alist-get 'audio_timestamps json))
+         (characters (utter--alignment-array-list (alist-get 'graph_chars timestamps)))
+         (pairs (utter--alignment-array-list (alist-get 'graph_times timestamps)))
+         (starts nil)
+         (ends nil))
+    (when pairs
+      (catch 'malformed
+        (dolist (pair pairs)
+          (setq pair (utter--alignment-array-list pair))
+          (unless (and pair (= (length pair) 2))
+            (throw 'malformed nil))
+          (push (nth 0 pair) starts)
+          (push (nth 1 pair) ends))
+        (utter--normalize-alignment (plist-get info :text) characters
+                                    (nreverse starts) (nreverse ends))))))
 
 (cl-defmethod utter--list-voices ((backend utter-xai) callback)
   "Fetch BACKEND's voices from GET /v1/tts/voices and call CALLBACK.

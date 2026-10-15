@@ -165,7 +165,7 @@ Each is called with (TEXT MAX-CHARS UNIT) and returns a list of
 strings or nil; the first non-nil result wins.")
 
 (defvar utter--first-segment-chars 200
-  "Character limit for the first segment, for fast first audio.")
+  "Initial character target for sentence packing, for fast first audio.")
 
 (defun utter--char-units (char unit)
   "Return the size of CHAR in UNIT: `chars', `bytes' or `utf16'."
@@ -290,31 +290,36 @@ FORBIDDEN intervals unless there is no other choice."
 
 (defun utter--split-by-sentence (text max-chars unit)
   "Split TEXT into segments of at most MAX-CHARS in UNIT.
-Sentences are packed together while they fit; the first segment
-is also kept under `utter--first-segment-chars' characters.  A
-sentence longer than MAX-CHARS is cut at whitespace or
-punctuation.  SSML tags are never cut."
+Sentences are packed together under a gradually growing character
+target, starting at `utter--first-segment-chars' and doubling after
+each emitted segment up to MAX-CHARS.  Complete sentences may exceed
+that soft target, but are hard-split, preferring whitespace or
+punctuation, when they exceed the backend's hard limit.  SSML tags
+are never cut."
   (let* ((max (max 1 (or max-chars most-positive-fixnum)))
+         (target (min max (max 1 utter--first-segment-chars)))
          (forbidden (utter--ssml-forbidden text))
          (segments nil)
          (cur-beg nil) (cur-end nil) (cur-size 0))
     (cl-flet ((flush ()
-                (when cur-beg (push (cons cur-beg cur-end) segments))
+                (when cur-beg
+                  (push (cons cur-beg cur-end) segments)
+                  (setq target (min max (* 2 target))))
                 (setq cur-beg nil cur-end nil cur-size 0))
               (fits (beg end size)
                 (and (<= size max)
-                     (or segments
-                         (<= (- (utter--trim-end text beg end) beg)
-                             utter--first-segment-chars)))))
+                     (<= (- (utter--trim-end text beg end) beg) target))))
       (dolist (span (utter--sentence-spans text forbidden))
         (let* ((b (car span)) (e (cdr span))
-               (trimmed (utter--range-measure text b (utter--trim-end text b e) unit))
+               (trim-end (utter--trim-end text b e))
+               (trimmed (utter--range-measure text b trim-end unit))
                (full (utter--range-measure text b e unit)))
           (cond
            ((> trimmed max)
             (flush)
             (dolist (piece (utter--hard-split text b e max unit forbidden))
-              (push piece segments)))
+              (push piece segments)
+              (setq target (min max (* 2 target)))))
            ((and cur-beg (fits cur-beg e (+ cur-size trimmed)))
             (setq cur-end e cur-size (+ cur-size full)))
            (t (flush)

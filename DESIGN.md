@@ -40,9 +40,9 @@ body predates the corrections applied here).
 | `utter-core.el` | CORE | backend struct, generics, key lookup, curl runner, decoders, `utter-request`, `utter-fetch-json`, cache | cl-lib, auth-source, json |
 | `utter-say.el` | CORE | macOS `say` backend (`process` kind) | core |
 | `utter-openai.el` | CORE | OpenAI-compatible `/v1/audio/speech` backend (OpenAI, OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI…) | core |
-| `utter-elevenlabs.el` | CORE | ElevenLabs backend (bytes; voices fetched) | core |
+| `utter-elevenlabs.el` | CORE | ElevenLabs backend (b64-json with alignment; voices fetched) | core |
 | `utter-gemini.el` | CORE, optional | Gemini `/v1beta/interactions` (b64-json WAV) | core |
-| `utter-xai.el` | CORE, optional | xAI `/v1/tts` grok-tts (bytes mp3/wav; voices fetched from `/v1/tts/voices`) | core |
+| `utter-xai.el` | CORE, optional | xAI `/v1/tts` grok-tts (b64-json mp3/wav with alignment; voices fetched from `/v1/tts/voices`) | core |
 | `utter-text.el` | ENGINE | preprocessing, sentence splitting into segments (private) | core (for `max-chars`) |
 | `utter-queue.el` | ENGINE | item/segment/queue structs, player struct, prefetch, `utter-state`, lighter, highlight | core, text |
 | `utter.el` | ENGINE | package main file: defcustoms, `utter-speak*` commands, `utter-enqueue`/`utter-interrupt` entry points, presets, scope, thing-at-point | queue |
@@ -88,7 +88,8 @@ Ownership rules for parallel work:
 
 (cl-defgeneric utter--request-data (backend text params))        ; -> plist body
 (cl-defgeneric utter--normalize-params (backend params))         ; clamp/rename
-(cl-defgeneric utter--response-audio (backend info callback))    ; (CALLBACK FILE FORMAT) | (CALLBACK nil ERR)
+(cl-defgeneric utter--response-audio (backend info callback))    ; (CALLBACK FILE FORMAT &optional ALIGNMENT) | (CALLBACK nil ERR)
+(cl-defgeneric utter--response-alignment (backend info json))    ; -> (:characters TEXT :starts VECTOR :ends VECTOR) | nil
 (cl-defgeneric utter--parse-error (backend info))                ; -> string or nil; RUNS ON EVERY RESPONSE
 (cl-defgeneric utter--list-voices (backend callback))            ; cached per name, utter-voice-cache-ttl
 (cl-defgeneric utter--start-process (backend text params file callback)) ; response-kind process
@@ -101,7 +102,7 @@ Ownership rules for parallel work:
 Return an `utter-request' struct (slots: process info status).
 CALLBACK is called (AUDIO INFO): AUDIO is a file name, nil on error
 (INFO :error), or the symbol `abort'.  INFO keys: :backend :model :voice
-:speed :format :text :file :cached :http-status :error :duration :request.
+:speed :format :text :file :cached :http-status :error :duration :alignment :request.
 Signals `utter-text-too-long' instead of splitting.")
 (utter-abort REQUEST)
 (utter-fetch-json BACKEND METHOD PATH CALLBACK &optional BODY)
@@ -164,10 +165,13 @@ OpenRouter needs `response_format` forced to `"mp3"`, Kokoro-FastAPI needs
 (defvar utter--first-segment-chars 200)             ; private; short first segment for fast first audio
 ```
 
-Splitting on `sentence-end` plus `。！？；`, packing under the limit, hard
-split at whitespace/punctuation only when one sentence exceeds the limit.
-Never split inside SSML tags. UNIT `bytes` counts UTF-8 bytes, `utf16`
-counts UTF-16 units.
+Splitting on `sentence-end` plus `。！？；`, packing under soft character
+targets starting at `utter--first-segment-chars` (200), doubling after each
+emitted segment until the backend limit. Complete sentences may exceed a
+soft target; hard splitting at whitespace/punctuation applies only when a
+sentence exceeds the backend limit. UNIT `bytes` counts UTF-8 bytes,
+`utf16` counts UTF-16 units; that hard limit is independent of soft character
+targets. Existing SSML protection applies.
 
 ### Queue and player (ENGINE)
 
@@ -240,11 +244,27 @@ synthesizing before first audio, `⏸` paused, `✗CODE` on error. Added to
 `global-mode-string` only while active; nil disables.
 
 Highlight: `utter-highlight` (nil). When on and the source is a live
-buffer, the item keeps segment markers and one overlay (face
-`utter-highlight`) follows `utter-progress-functions`. When
-`buffer-chars-modified-tick` differs from the captured tick, remove the
-overlay and markers for that item. `utter-highlight-follow` (nil) is the
-only thing that may move point or recenter.
+buffer, tagged segment text maps sentence boundaries back to source markers.
+xAI and ElevenLabs request base64 audio plus character timing metadata.
+`utter-request` returns validated `:alignment` as `(:characters TEXT :starts
+VECTOR :ends VECTOR)`, indexed by input characters in audio seconds. Timings
+must match the request text and have finite, nonnegative, ordered start/end
+values. Invalid/missing metadata leaves audio playable with segment-level
+highlighting; Gemini and other untimed backends also use segment markers.
+
+A process-owned 50 ms timer advances sentence cues through
+`utter-progress-functions`, using elapsed time, the captured playback rate,
+and accumulated pause time. Restart-on-resume players transfer the current
+cue position. Player exit, stop, source edits and queue reset cancel timing
+updates. Timing is relative to process startup, not audio-device feedback.
+When `buffer-chars-modified-tick` differs from the captured tick, remove the
+overlay and segment/sentence markers for that item. `utter-highlight-follow`
+(nil) is the only thing that may move point or recenter.
+
+Alignment persists in `<cache-key>.alignment.json`, validated again on replay.
+Timestamp-capable backends use a versioned cache key to bypass old audio-only
+entries. Cache clear/prune removes paired audio and alignment, counts both
+sizes toward the limit, and removes orphan alignment files.
 
 ### Commands and defcustoms (ENGINE, in `utter.el`)
 

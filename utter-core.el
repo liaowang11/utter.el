@@ -267,9 +267,10 @@ The message is taken from the JSON body when there is one."
 
 (cl-defgeneric utter--response-audio (backend info callback)
   "Turn the raw response described by INFO into a playable file.
-INFO has :raw-file :http-status :format :file.  Call CALLBACK with
-\(FILE FORMAT) on success or (nil ERROR-STRING) on failure.  The
-default method dispatches on BACKEND's `response-kind'.")
+INFO has :raw-file :http-status :format :file and :text.  Call CALLBACK with
+\(FILE FORMAT) on success, optionally followed by response metadata,
+or (nil ERROR-STRING) on failure.  The default method dispatches on
+BACKEND's `response-kind'.")
 
 (cl-defmethod utter--response-audio ((backend utter-backend) info callback)
   "Decode INFO for BACKEND according to its `response-kind'; call CALLBACK."
@@ -278,6 +279,15 @@ default method dispatches on BACKEND's `response-kind'.")
     ('b64-json (utter--decode-b64-json backend info callback))
     (kind (funcall callback nil
                    (format "utter: response kind `%s' is not implemented yet" kind)))))
+
+(cl-defgeneric utter--response-alignment (backend info json)
+  "Return BACKEND's normalized timing metadata from response JSON, or nil.
+INFO contains the request's :text.  JSON is parsed into alists and
+lists.  A non-nil result has :characters, :starts and :ends.")
+
+(cl-defmethod utter--response-alignment ((_backend utter-backend) _info _json)
+  "Return nil for backends without response alignment metadata."
+  nil)
 
 (cl-defgeneric utter--list-voices (backend callback)
   "Call CALLBACK with BACKEND's voices, a list of NAME or (NAME . PLIST).
@@ -787,9 +797,65 @@ current value."
               (alist-get (if (stringp step) (intern step) step) node))
              (t nil))))))
 
+(defun utter--finite-number-p (number)
+  "Return non-nil if NUMBER is a finite real number."
+  (and (numberp number)
+       (or (integerp number)
+           (condition-case nil
+               (progn (truncate number) t)
+             (error nil)))))
+
+(defun utter--alignment-array-list (array)
+  "Return ARRAY as a list when it is a JSON array, or nil otherwise."
+  (cond ((and (vectorp array) (not (stringp array))) (append array nil))
+        ((listp array) array)))
+
+(defun utter--normalize-alignment (text characters starts ends)
+  "Return normalized alignment for TEXT, or nil when it is unusable.
+CHARACTERS may be a string or array of one-character strings.
+STARTS and ENDS must be arrays with one finite, nonnegative time per
+input character, in nondecreasing order, with each start no later
+than its end."
+  (when (stringp text)
+    (let* ((char-array (utter--alignment-array-list characters))
+           (character-string
+            (cond
+             ((stringp characters) characters)
+             ((and char-array
+                   (cl-every (lambda (char) (and (stringp char) (= (length char) 1)))
+                             char-array))
+              (mapconcat #'identity char-array ""))))
+           (start-vector (cond ((and (vectorp starts) (not (stringp starts))) starts)
+                               ((listp starts) (vconcat starts))))
+           (end-vector (cond ((and (vectorp ends) (not (stringp ends))) ends)
+                             ((listp ends) (vconcat ends)))))
+      (when (and (stringp character-string)
+                 (equal character-string text)
+                 (= (length character-string) (length text))
+                 start-vector end-vector
+                 (> (length text) 0)
+                 (= (length start-vector) (length text))
+                 (= (length end-vector) (length text)))
+        (let ((previous-start -1) (previous-end -1) valid)
+          (setq valid t)
+          (cl-loop for start across start-vector
+                   for end across end-vector
+                   while valid
+                   do (unless (and (utter--finite-number-p start)
+                                   (utter--finite-number-p end)
+                                   (>= start 0) (>= end start)
+                                   (>= start previous-start)
+                                   (>= end previous-end))
+                        (setq valid nil))
+                   do (setq previous-start start previous-end end))
+          (when valid
+            (list :characters text
+                  :starts start-vector
+                  :ends end-vector)))))))
+
 (defun utter--decode-b64-json (backend info callback)
   "Decode base64 audio at BACKEND's `response-path' in INFO's body.
-Call CALLBACK with the written file and its format."
+Call CALLBACK with the written file, its format and optional response metadata."
   (let* ((raw (plist-get info :raw-file))
          (json (utter--json-read-file raw))
          (data (and json (utter--json-path json (utter-backend-response-path backend)))))
@@ -810,7 +876,12 @@ Call CALLBACK with the written file and its format."
                        (error nil)))))
         (if (or (null bytes) (string-empty-p bytes))
             (funcall callback nil "utter: invalid base64 audio")
-          (funcall callback (plist-get info :file) (utter--write-audio bytes info))))))))
+          (funcall callback
+                   (plist-get info :file)
+                   (utter--write-audio bytes info)
+                   (condition-case nil
+                       (utter--response-alignment backend info json)
+                     (error nil)))))))))
 
 ;;;; Cache
 
@@ -822,16 +893,22 @@ Call CALLBACK with the written file and its format."
 (defun utter-cache-key (backend params text)
   "Return the cache key for TEXT synthesized by BACKEND with PARAMS.
 It is the sha1 of the backend name, model, voice, speed, format,
-language, instructions and TEXT.  Host and key are left out, so a
-rotated key keeps the cache.  BACKEND is a backend or a name."
-  (let ((name (if (utter-backend-p backend) (utter-backend-name backend) backend))
-        (speed (plist-get params :speed)))
+language, instructions and TEXT; timestamp-capable backends use a
+separate versioned key.  Host and key are left out, so a rotated key
+keeps the cache.  BACKEND is a backend or a name."
+  (let* ((resolved (if (utter-backend-p backend) backend
+                     (and (stringp backend) (utter-get-backend backend))))
+         (name (if (utter-backend-p backend) (utter-backend-name backend) backend))
+         (speed (plist-get params :speed))
+         (timestamps (and resolved
+                          (memq 'timestamps (utter-backend-capabilities resolved)))))
     (sha1 (encode-coding-string
            (prin1-to-string
-            (list name (plist-get params :model) (plist-get params :voice)
-                  (and speed (float speed)) (plist-get params :format)
-                  (plist-get params :language) (plist-get params :instructions)
-                  text))
+            (append (list name (plist-get params :model) (plist-get params :voice)
+                          (and speed (float speed)) (plist-get params :format)
+                          (plist-get params :language) (plist-get params :instructions))
+                    (when timestamps '(timestamps-v1))
+                    (list text)))
            'utf-8))))
 
 (defun utter-cache-lookup (key format)
@@ -841,36 +918,108 @@ rotated key keeps the cache.  BACKEND is a backend or a name."
          (> (file-attribute-size (file-attributes f)) 0)
          f)))
 
+(defun utter-cache-alignment-file (key)
+  "Return the JSON sidecar file name for cached alignment KEY."
+  (expand-file-name (concat key ".alignment.json") utter-cache-directory))
+
+(defun utter--cache-alignment-lookup (key text)
+  "Return cached alignment for KEY if its JSON sidecar matches TEXT."
+  (let ((file (utter-cache-alignment-file key)))
+    (when (file-exists-p file)
+      (let ((json (utter--json-read-file file)))
+        (when (and (consp json) (consp (car json)) (symbolp (caar json)))
+          (utter--normalize-alignment
+           text (alist-get 'characters json)
+           (alist-get 'starts json) (alist-get 'ends json)))))))
+
+(defun utter--cache-alignment-store (key text alignment)
+  "Store validated ALIGNMENT for TEXT under KEY as JSON, or remove it."
+  (let* ((file (utter-cache-alignment-file key))
+         (normalized (and alignment
+                          (utter--normalize-alignment
+                           text (plist-get alignment :characters)
+                           (plist-get alignment :starts)
+                           (plist-get alignment :ends)))))
+    (if normalized
+        (condition-case nil
+            (progn
+              (make-directory (file-name-directory file) t)
+              (let ((coding-system-for-write 'utf-8-unix))
+                (with-temp-file file
+                  (set-buffer-multibyte t)
+                  (insert (utter--json-encode normalized))))
+              normalized)
+          (error (ignore-errors (delete-file file)) nil))
+      (when (file-exists-p file) (delete-file file))
+      nil)))
+
 (defun utter--cache-files ()
   "Return the audio files in `utter-cache-directory'."
   (and (file-directory-p utter-cache-directory)
        (directory-files utter-cache-directory t "\\`[0-9a-f]\\{40\\}\\.[a-z0-9]+\\'")))
 
+(defun utter--cache-alignment-files ()
+  "Return alignment sidecars in `utter-cache-directory'."
+  (and (file-directory-p utter-cache-directory)
+       (directory-files utter-cache-directory t
+                        "\\`[0-9a-f]\\{40\\}\\.alignment\\.json\\'")))
+
+(defun utter--cache-delete-pair (audio-file)
+  "Delete AUDIO-FILE and its paired alignment sidecar, if any."
+  (let ((sidecar (utter-cache-alignment-file (file-name-base audio-file))))
+    (when (file-exists-p audio-file) (delete-file audio-file))
+    (when (file-exists-p sidecar) (delete-file sidecar))))
+
+(defun utter--cache-remove-orphan-alignments ()
+  "Delete alignment sidecars whose audio cache file no longer exists."
+  (let ((keys (make-hash-table :test #'equal)))
+    (dolist (audio (utter--cache-files))
+      (puthash (file-name-base audio) t keys))
+    (dolist (sidecar (utter--cache-alignment-files))
+      (let ((key (string-remove-suffix ".alignment" (file-name-base sidecar))))
+        (unless (gethash key keys) (delete-file sidecar))))))
+
+(defun utter--cache-groups ()
+  "Return cache audio and sidecar groups with sizes and access times."
+  (mapcar
+   (lambda (audio)
+     (let* ((sidecar (utter-cache-alignment-file (file-name-base audio)))
+            (files (if (file-exists-p sidecar) (list audio sidecar) (list audio)))
+            (attributes (mapcar #'file-attributes files)))
+       (list :files files
+             :size (apply #'+ (mapcar #'file-attribute-size attributes))
+             :access-time (file-attribute-access-time (car attributes)))))
+   (utter--cache-files)))
+
 (defun utter-cache-clear (&optional older-than-days)
-  "Delete cached audio files; with OLDER-THAN-DAYS only older ones.
-Age is measured from the last access time.  Interactively, a
-prefix argument gives OLDER-THAN-DAYS."
+  "Delete cached audio and timing; with OLDER-THAN-DAYS only older ones.
+Age is measured from the audio file's last access time.  Interactively,
+a prefix argument gives OLDER-THAN-DAYS."
   (interactive "P")
   (let ((limit (and older-than-days
                     (- (float-time) (* 86400 (prefix-numeric-value older-than-days))))))
     (dolist (f (utter--cache-files))
       (when (or (null limit)
                 (< (float-time (file-attribute-access-time (file-attributes f))) limit))
-        (delete-file f)))))
+        (utter--cache-delete-pair f)))
+    (utter--cache-remove-orphan-alignments)))
 
 (defun utter-cache-prune (&optional max-size)
-  "Delete least recently accessed cache files above MAX-SIZE bytes.
+  "Delete least recently accessed cache pairs above MAX-SIZE bytes.
 MAX-SIZE defaults to `utter-cache-max-size'; nil means no limit."
   (let ((max (or max-size utter-cache-max-size)))
+    (utter--cache-remove-orphan-alignments)
     (when max
-      (let* ((files (mapcar (lambda (f) (cons f (file-attributes f))) (utter--cache-files)))
-             (total (apply #'+ (mapcar (lambda (e) (file-attribute-size (cdr e))) files))))
-        (dolist (e (sort files (lambda (a b)
-                                 (time-less-p (file-attribute-access-time (cdr a))
-                                              (file-attribute-access-time (cdr b))))))
+      (let* ((groups (utter--cache-groups))
+             (total (apply #'+ (mapcar (lambda (group) (plist-get group :size)) groups))))
+        (dolist (group (sort groups
+                             (lambda (a b)
+                               (time-less-p (plist-get a :access-time)
+                                            (plist-get b :access-time)))))
           (when (> total max)
-            (setq total (- total (file-attribute-size (cdr e))))
-            (delete-file (car e))))))))
+            (setq total (- total (plist-get group :size)))
+            (dolist (file (plist-get group :files))
+              (when (file-exists-p file) (delete-file file)))))))))
 
 ;;;; Requests
 
@@ -959,8 +1108,10 @@ LANGUAGE, INSTRUCTIONS and CONTEXT (a plist with :previous and
 FILE is where the audio goes; otherwise the cache (when CACHE is
 non-nil) or a temporary file.
 CALLBACK is called (AUDIO INFO): AUDIO is a file name, nil on error
-\(INFO :error), or the symbol `abort'.  INFO keys: :backend :model :voice
-:speed :format :text :file :cached :http-status :error :duration :request.
+\(INFO :error), or the symbol `abort'.  INFO keys include :backend :model
+:voice :speed :format :text :file :cached :http-status :error :duration
+:alignment :request.  :alignment, when valid, is (:characters TEXT :starts
+VECTOR :ends VECTOR), indexed by input characters in audio seconds.
 With DRY-RUN, return a plist (:url :headers :body :curl-args), with
 header values redacted, and start nothing.
 Signals `utter-text-too-long' instead of splitting."
@@ -976,7 +1127,7 @@ Signals `utter-text-too-long' instead of splitting."
                                   :context context)))
            (fmt (plist-get params :format))
            (key (and cache (utter-cache-key backend params text)))
-           (info (append (list :backend backend :text text :cached nil) params))
+           (info (append (list :backend backend :text text :cached nil :alignment nil) params))
            (req (utter--make-request :info info :callback callback))
            (process-kind (eq (utter-backend-response-kind backend) 'process)))
       (setq info (plist-put info :request req))
@@ -991,7 +1142,8 @@ Signals `utter-text-too-long' instead of splitting."
                   :body (utter--request-body backend text params)
                   :curl-args (utter--curl-args backend raw)))))
        ((and key (utter-cache-lookup key fmt))
-        (let ((hit (utter-cache-lookup key fmt)))
+        (let* ((hit (utter-cache-lookup key fmt))
+               (alignment (utter--cache-alignment-lookup key text)))
           (when file
             (make-directory (file-name-directory (expand-file-name file)) t)
             (copy-file hit file t))
@@ -1002,9 +1154,12 @@ Signals `utter-text-too-long' instead of splitting."
           (setf (utter-request-status req) 'running)
           (setf (utter-request-timer req)
                 (run-at-time 0 nil (lambda ()
-                                     (setf (utter-request-info req)
-                                           (plist-put (utter-request-info req)
-                                                      :format (utter--container-format fmt)))
+                                     (let ((info (utter-request-info req)))
+                                       (setq info (plist-put info :format
+                                                             (utter--container-format fmt)))
+                                       (when alignment
+                                         (setq info (plist-put info :alignment alignment)))
+                                       (setf (utter-request-info req) info))
                                      (utter--finish req (or file hit)))))
           req))
        (t
@@ -1013,15 +1168,20 @@ Signals `utter-text-too-long' instead of splitting."
                         (make-temp-file "utter-" nil
                                         (concat "." (symbol-name (utter--container-format fmt))))))
                (on-audio
-                (lambda (audio-file result)
+                (lambda (audio-file result &optional alignment)
                   (if (null audio-file)
                       (utter--finish req nil result)
-                    (setf (utter-request-info req)
-                          (plist-put (utter-request-info req) :format result))
-                    (when (and file key)
+                    (let ((info (utter-request-info req)))
+                      (setq info (plist-put info :format result))
+                      (when alignment
+                        (setq info (plist-put info :alignment alignment)))
+                      (setf (utter-request-info req) info))
+                    (when key
                       (ignore-errors
                         (make-directory utter-cache-directory t)
-                        (copy-file audio-file (utter-cache-file key fmt) t)))
+                        (when file
+                          (copy-file audio-file (utter-cache-file key fmt) t))
+                        (utter--cache-alignment-store key text alignment)))
                     (utter--finish req audio-file)))))
           (setq info (plist-put info :file out))
           (unless file (setq info (plist-put info :partial-file out)))
@@ -1052,7 +1212,7 @@ TEXT-FILE holds TEXT.  Used for dry runs and by process backends.")
 
 (defun utter--start-curl (req backend text params out on-audio)
   "Start the curl request REQ for TEXT on BACKEND with PARAMS.
-OUT is the destination file; ON-AUDIO receives (FILE FORMAT) or
+OUT is the destination file; ON-AUDIO receives (FILE FORMAT [METADATA]) or
 \(nil ERROR)."
   (let* ((info (utter-request-info req))
          (body (utter--request-body backend text params))
@@ -1074,7 +1234,8 @@ OUT is the destination file; ON-AUDIO receives (FILE FORMAT) or
                    (utter--finish req nil err)
                  (let* ((rinfo (list :raw-file raw :http-status status
                                      :format (plist-get params :format)
-                                     :file out
+                                     :file out :text text
+                                     :model (plist-get params :model)
                                      :sample-rate (plist-get params :sample-rate)))
                         (perr (or (utter--parse-error backend rinfo)
                                   (unless (and status (<= 200 status 299))

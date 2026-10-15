@@ -172,7 +172,10 @@ status, backend and voice, first words, progress and source. There,
 2. **Clean up and split.** `utter-preprocess-functions` strip markup,
    replace URLs and apply `utter-pronunciation-alist`. The text is then
    split at sentence ends into pieces that fit the backend's per-request
-   limit, with a short first piece so audio starts quickly.
+   limit. Packing targets grow from 200 to 400, 800, 1,600 and 3,200
+   characters, then reach the backend limit, avoiding a tiny title followed
+   immediately by a maximum-sized request. A complete sentence may exceed
+   the target, but never the backend's hard limit.
 3. **Prefetch.** Each piece is synthesized by an async `curl` process
    (or `say -o`), two pieces ahead of playback, so audio stays
    continuous while you work elsewhere.
@@ -182,6 +185,23 @@ status, backend and voice, first words, progress and source. There,
 5. **Play.** `afplay` plays each file in order (`ffplay` or `mpv` where
    `afplay` is missing). Pause and resume are SIGSTOP and SIGCONT;
    rate changes go to the player.
+
+With **Highlight spoken text** enabled, xAI and ElevenLabs use returned
+character timestamps to highlight the current sentence, independently of
+request-sized pieces. Timings are cached alongside the audio and removed
+by cache clear/prune. Old audio-only cache entries for these backends are
+not reused, so the first repeat after upgrading makes a new request.
+These backends always request timing metadata; xAI's alignment pass can add
+synthesis latency. Gemini and other backends without usable timing data
+continue to highlight the playing piece. Missing, malformed or mismatched
+timings also fall back to piece-level highlighting without discarding audio.
+
+Sentence highlighting uses the player process's elapsed time, adjusted for
+pause/resume and playback speed, with updates every 50 ms. Player startup
+and output buffering can introduce an offset; this is not sample-accurate
+synchronization. Editing the source immediately removes its highlighting.
+Playback still waits for each complete audio file, so slow synthesis can
+still cause gaps despite prefetch and gradual chunk growth.
 
 Every response is checked: HTTP errors, JSON error bodies returned with
 status 200, and non-audio bytes are reported instead of played.

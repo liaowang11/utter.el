@@ -135,7 +135,8 @@ private; use `utter--item-segments' and `utter--item-position'."
 STATUS is one of `pending', `synthesizing', `retry', `ready',
 `playing', `done' or `error'.  START and END are positions in the
 item text."
-  index text status file request error duration start end format (retries 0))
+  index text status file request error duration start end format source-text cues
+  (retries 0))
 
 (defsubst utter--item-segments (item)
   "Return the segments of ITEM."
@@ -441,7 +442,8 @@ when the tags did not survive preprocessing."
                  (setq from (+ start (length s)))
                  (utter--make-segment :index (cl-incf index) :text s
                                       :status 'pending
-                                      :start start :end from)))
+                                      :start start :end from
+                                      :source-text (and utter-highlight buffer piece))))
              pieces))))
 
 ;;;; Status
@@ -592,6 +594,76 @@ Other utterances stay; a message says why."
 (defvar utter--highlight-overlay nil
   "The overlay on the text being spoken, when highlighting.")
 
+(defun utter--progress-stop (proc)
+  "Cancel the sentence progress timer attached to PROC."
+  (when (processp proc)
+    (when-let* ((timer (process-get proc 'utter-progress-timer)))
+      (cancel-timer timer)
+      (process-put proc 'utter-progress-timer nil))))
+
+(defun utter--sentence-cues (item seg alignment)
+  "Map SEG's sentence boundaries and ALIGNMENT to source markers in ITEM.
+Each cue is [SECONDS START END BEG-MARKER END-MARKER].  START and
+END are offsets in the processed item text.  Return nil if source
+positions or matching character timings are unavailable."
+  (when-let* (((not (utter--highlight-stale-p item)))
+              (piece (utter--segment-source-text seg))
+              ((equal (plist-get alignment :characters) (utter--segment-text seg)))
+              (starts (plist-get alignment :starts))
+              (bounds (nth (utter--segment-index seg) (utter-item-markers item))))
+    (let* ((spans (with-current-buffer (utter-item-source-buffer item)
+                    (utter--sentence-spans piece (utter--ssml-forbidden piece))))
+           (sentences (mapcar (lambda (span) (substring piece (car span) (cdr span)))
+                              spans))
+           (positions (mapcar #'utter--tag-at sentences))
+           (buffer (utter-item-source-buffer item)))
+      (when (and (= (length starts) (length piece))
+                 (cl-every #'identity positions))
+        (cl-loop for span in spans
+                 for (pos . rest) on positions
+                 collect (vector (aref starts (utter--skip-space piece (car span)))
+                                 (+ (utter--segment-start seg) (car span))
+                                 (+ (utter--segment-start seg) (cdr span))
+                                 (with-current-buffer buffer (copy-marker pos))
+                                 (with-current-buffer buffer
+                                   (copy-marker (or (car rest) (cdr bounds))))))))))
+
+(defun utter--progress-tick (proc)
+  "Advance the sentence highlight to PROC's current audio position.
+Use the player's captured rate and exclude paused wall time."
+  (let* ((q utter--queue)
+         (item (utter--qstate-current q))
+         (seg (process-get proc 'utter-segment)))
+    (cond
+     ((or (not (eq proc (utter--qstate-process q)))
+          (not item) (not (utter-item-markers item)))
+      (utter--progress-stop proc))
+     ((utter--highlight-stale-p item)
+      (utter--highlight-drop item))
+     ((not (utter--qstate-paused q))
+      (let* ((elapsed (* (or (process-get proc 'utter-rate) 1.0)
+                         (- (float-time) (utter--qstate-seg-start q)
+                            (utter--qstate-paused-total q))))
+             (cues (or (process-get proc 'utter-progress-tail)
+                       (utter--segment-cues seg)))
+             (cue (car cues)))
+        (while (and (cdr cues) (<= (aref (cadr cues) 0) elapsed))
+          (setq cues (cdr cues) cue (car cues)))
+        (process-put proc 'utter-progress-tail cues)
+        (when (and cue (not (eq cue (process-get proc 'utter-progress-cue))))
+          (process-put proc 'utter-progress-cue cue)
+          (run-hook-with-args 'utter-progress-functions item
+                              (aref cue 1) (aref cue 2))))))))
+
+(defun utter--progress-start (proc)
+  "Start sentence progress tracking for PROC when timing cues exist."
+  (utter--progress-stop proc)
+  (when (utter--segment-cues (process-get proc 'utter-segment))
+    (utter--progress-tick proc)
+    (when (utter-item-markers (utter--qstate-current utter--queue))
+      (process-put proc 'utter-progress-timer
+                   (run-at-time 0.05 0.05 #'utter--progress-tick proc)))))
+
 (defun utter--highlight-delete ()
   "Remove the highlight overlay."
   (when (overlayp utter--highlight-overlay)
@@ -606,7 +678,15 @@ Other utterances stay; a message says why."
       (utter--highlight-delete)))
   (dolist (m (utter-item-markers item))
     (when m (set-marker (car m) nil) (set-marker (cdr m) nil)))
-  (setf (utter-item-markers item) nil))
+  (dolist (seg (utter--item-segments item))
+    (dolist (cue (utter--segment-cues seg))
+      (set-marker (aref cue 3) nil)
+      (set-marker (aref cue 4) nil))
+    (setf (utter--segment-cues seg) nil
+          (utter--segment-source-text seg) nil))
+  (setf (utter-item-markers item) nil)
+  (when (eq item (utter--qstate-current utter--queue))
+    (utter--progress-stop (utter--qstate-process utter--queue))))
 
 (defun utter--highlight-stale-p (item)
   "Return non-nil if the source of ITEM changed since it was captured."
@@ -627,26 +707,31 @@ Other utterances stay; a message says why."
                    (utter--qstate-items utter--queue))
     (remove-hook 'after-change-functions #'utter--highlight-after-change t)))
 
-(defun utter--highlight-progress (item _start _end)
-  "Move the highlight to the part of ITEM being spoken."
+(defun utter--highlight-progress (item start _end)
+  "Move the highlight to the part of ITEM at processed text offset START."
   (when (and (utter-item-p item) (utter-item-markers item))
     (if (utter--highlight-stale-p item)
         (utter--highlight-drop item)
-      (let* ((m (nth (utter--item-position item) (utter-item-markers item)))
+      (let* ((seg (nth (utter--item-position item) (utter--item-segments item)))
+             (cue (cl-find start (utter--segment-cues seg)
+                           :key (lambda (c) (aref c 1))))
+             (m (nth (utter--item-position item) (utter-item-markers item)))
+             (beg (if cue (aref cue 3) (car m)))
+             (end (if cue (aref cue 4) (cdr m)))
              (buf (utter-item-source-buffer item)))
-        (if (not m)
+        (if (not beg)
             (utter--highlight-delete)
           (if (overlayp utter--highlight-overlay)
-              (move-overlay utter--highlight-overlay (car m) (cdr m) buf)
-            (setq utter--highlight-overlay (make-overlay (car m) (cdr m) buf))
+              (move-overlay utter--highlight-overlay beg end buf)
+            (setq utter--highlight-overlay (make-overlay beg end buf))
             (overlay-put utter--highlight-overlay 'face 'utter-highlight)
             (overlay-put utter--highlight-overlay 'utter t))
           (with-current-buffer buf
             (add-hook 'after-change-functions #'utter--highlight-after-change nil t))
           (when utter-highlight-follow
             (dolist (w (get-buffer-window-list buf nil t))
-              (unless (pos-visible-in-window-p (car m) w)
-                (set-window-point w (car m))))))))))
+              (unless (pos-visible-in-window-p beg w)
+                (set-window-point w beg)))))))))
 
 ;;;; Requests
 
@@ -688,6 +773,8 @@ Other utterances stay; a message says why."
             (utter--format-symbol (or (plist-get info :format)
                                       (file-name-extension audio)))
             (utter--segment-duration seg) (plist-get info :duration)
+            (utter--segment-cues seg)
+            (utter--sentence-cues item seg (plist-get info :alignment))
             (utter--segment-status seg) 'ready))
      ((eq audio 'abort)
       (utter--segment-failed item seg "request aborted"))
@@ -838,8 +925,10 @@ Other utterances stay; a message says why."
         (let ((n (length (utter--qstate-run q))))
           (message "utter: playing %s%s" (utter-item-source-name item)
                    (if (> n 1) (format " (%d/%d)" (utter--run-index item) n) ""))))
-      (run-hook-with-args 'utter-progress-functions item
-                          (utter--segment-start seg) (utter--segment-end seg)))
+      (if (utter--segment-cues seg)
+          (utter--progress-start proc)
+        (run-hook-with-args 'utter-progress-functions item
+                            (utter--segment-start seg) (utter--segment-end seg))))
      ((not player)
       (utter--segment-failed
        item seg (format "no player for %s audio; install ffplay or mpv, or set `utter-player'"
@@ -859,6 +948,8 @@ Other utterances stay; a message says why."
 
 (defun utter--player-sentinel (proc _event)
   "Advance the queue when the player PROC exits."
+  (when (memq (process-status proc) '(exit signal))
+    (utter--progress-stop proc))
   (when (and (memq (process-status proc) '(exit signal))
              (not (process-get proc 'utter-stopped))
              (eq proc (utter--qstate-process utter--queue)))
@@ -881,6 +972,7 @@ Other utterances stay; a message says why."
   "Stop the player without advancing the queue."
   (let ((q utter--queue))
     (when-let* ((proc (utter--qstate-process q)))
+      (utter--progress-stop proc)
       (process-put proc 'utter-stopped t)
       (let ((seg (process-get proc 'utter-segment)))
         (when (and seg (eq (utter--segment-status seg) 'playing))
@@ -1074,12 +1166,16 @@ stay listed and can be replayed.  PARAMS are as for
         (let ((new (funcall (utter-player-resume (process-get proc 'utter-player))
                             proc)))
           (when (and (processp new) (not (eq new proc)))
+            (utter--progress-stop proc)
             (process-put new 'utter-was-paused t)
+            (process-put new 'utter-progress-cue (process-get proc 'utter-progress-cue))
+            (process-put new 'utter-progress-tail (process-get proc 'utter-progress-tail))
             (setf (utter--qstate-process q) new)))
         (when (utter--qstate-pause-start q)
           (cl-incf (utter--qstate-paused-total q)
                    (- (float-time) (utter--qstate-pause-start q))))
-        (setf (utter--qstate-pause-start q) nil))
+        (setf (utter--qstate-pause-start q) nil)
+        (utter--progress-start (utter--qstate-process q)))
       (setf (utter-item-status (utter--qstate-current q)) 'playing)
       (message "utter: resumed")
       (utter--schedule))))

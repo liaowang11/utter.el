@@ -124,6 +124,8 @@ Unlike `utter-speed' it needs no new synthesis.  See
 
 (defcustom utter-highlight nil
   "When non-nil, highlight the text being spoken in its buffer.
+Highlight the current sentence when the backend supplies usable timing
+metadata (xAI and ElevenLabs), otherwise the playing request-sized piece.
 The highlight is removed as soon as the buffer text changes."
   :type 'boolean
   :group 'utter)
