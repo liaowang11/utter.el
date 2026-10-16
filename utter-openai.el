@@ -40,22 +40,29 @@
 ;;     :request-params '(:response_format "mp3"))
 ;;
 ;; Kokoro-FastAPI streams by default and lists voices at
-;; GET /v1/audio/voices:
+;; GET /v1/audio/voices.  Whole audio needs :stream :false; with the
+;; `streaming' capability and `utter-streaming' on, :stream-params
+;; asks for the stream instead:
 ;;
 ;;   (utter-make-openai "Kokoro"
 ;;     :protocol "http" :host "localhost:8880" :key nil
 ;;     :models '(kokoro) :formats '(mp3 wav)
 ;;     :voices #'utter-openai-fetch-voices
-;;     :request-params '(:stream :false)
-;;     :max-chars 1000 :capabilities nil)
+;;     :request-params '(:stream :false) :stream-params '(:stream t)
+;;     :max-chars 1000 :capabilities '(streaming))
 ;;
-;; mlx-audio names the instructions field `instruct':
+;; mlx-audio names the instructions field `instruct'.  Its streaming
+;; mode has not been tried with utter, so the preset leaves it off:
 ;;
 ;;   (utter-make-openai "mlx-audio"
 ;;     :protocol "http" :host "localhost:8000" :key nil
 ;;     :models '(mlx-community/Kokoro-82M-bf16) :formats '(wav mp3)
 ;;     :voices #'utter-openai-fetch-voices
 ;;     :instructions-key :instruct)
+;;
+;; OpenAI documents audio sent as it is generated; add `streaming' to
+;; its :capabilities to try it (not yet checked against the live
+;; API).  stream_format is never sent.
 ;;
 ;; Other renames or extra fields (mlx-audio `lang_code') go through
 ;; :request-params or :body-transform, a function from body plist to
@@ -74,8 +81,10 @@ gpt-4o-mini-tts also has ballad, verse, marin and cedar.")
                             (:constructor utter--make-openai)
                             (:copier nil))
   "An OpenAI-compatible /v1/audio/speech backend.
-INSTRUCTIONS-KEY is the body key used for instructions."
-  (instructions-key :instructions))
+INSTRUCTIONS-KEY is the body key used for instructions.
+STREAM-PARAMS is a plist merged into the body of a streamed request."
+  (instructions-key :instructions)
+  stream-params)
 
 ;;;###autoload
 (cl-defun utter-make-openai
@@ -85,7 +94,8 @@ INSTRUCTIONS-KEY is the body key used for instructions."
                                     (tts-1-hd :voices ,utter-openai-tts-1-voices)))
           (voices (append utter-openai-tts-1-voices '("ballad" "verse" "marin" "cedar")))
           (formats '(mp3 wav opus aac flac pcm)) (max-chars 4096)
-          (capabilities '(instructions)) (instructions-key :instructions))
+          (capabilities '(instructions)) (instructions-key :instructions)
+          stream-params)
   "Register and return an OpenAI-compatible speech backend called NAME.
 HOST, PROTOCOL and ENDPOINT make the URL.  KEY is a string, symbol
 or function (default: auth-source by HOST); nil means no key.
@@ -96,8 +106,11 @@ BODY-TRANSFORM a function applied to the body after that.
 MODELS, VOICES and FORMATS list what the server offers; the first
 of each is the default.  VOICES may also be a function such as
 `utter-openai-fetch-voices'.  MAX-CHARS is the per-request text
-limit.  CAPABILITIES may contain `instructions'.  INSTRUCTIONS-KEY
-names the body field for instructions (mlx-audio uses :instruct).
+limit.  CAPABILITIES may contain `instructions' and `streaming'; with
+`streaming' a request made with :stream plays the audio as it
+arrives.  STREAM-PARAMS is a plist merged into the body of such a
+request, after REQUEST-PARAMS.  INSTRUCTIONS-KEY names the body
+field for instructions (mlx-audio uses :instruct).
 See the Commentary for OpenRouter, Kokoro-FastAPI and mlx-audio."
   (declare (indent 1))
   (setf (utter-get-backend name)
@@ -108,6 +121,7 @@ See the Commentary for OpenRouter, Kokoro-FastAPI and mlx-audio."
          :body-transform body-transform
          :models models :voices voices :formats formats :max-chars max-chars
          :capabilities capabilities :instructions-key instructions-key
+         :stream-params stream-params
          :response-kind 'bytes)))
 
 (defun utter-openai--string (value)
@@ -133,6 +147,16 @@ See the Commentary for OpenRouter, Kokoro-FastAPI and mlx-audio."
      (when-let* ((speed (plist-get params :speed))) (list :speed speed))
      (when (and instructions (not (string-empty-p instructions)))
        (list (utter-openai-instructions-key backend) instructions)))))
+
+(cl-defmethod utter--stream-kind ((backend utter-openai))
+  "Return `bytes' when BACKEND has the `streaming' capability."
+  (and (memq 'streaming (utter-backend-capabilities backend)) 'bytes))
+
+(cl-defmethod utter--stream-request-body ((backend utter-openai) body _params)
+  "Merge BACKEND's `stream-params' into BODY.
+stream_format is not sent: the default is raw audio, and `sse' is
+not available for every model."
+  (utter--merge-plists body (copy-tree (utter-openai-stream-params backend))))
 
 (defun utter-openai--parse-voices (json)
   "Return a voice list from a voices JSON response.

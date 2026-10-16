@@ -131,6 +131,73 @@
           (should (equal (plist-get json :voice) "zf_xiaobei"))
           (delete-file (car res)))))))
 
+(defun utter-openai-test-kokoro (host)
+  "Return the streaming Kokoro-FastAPI preset from the Commentary on HOST."
+  (utter-make-openai "Kokoro-stream"
+    :protocol "http" :host host :key nil
+    :models '(kokoro) :formats '(mp3 wav)
+    :request-params '(:stream :false) :stream-params '(:stream t)
+    :max-chars 1000 :capabilities '(streaming)))
+
+(ert-deftest utter-openai-test-no-streaming-by-default ()
+  "The default backend does not stream, so :stream t changes nothing."
+  (let ((b (utter-make-openai "OpenAI-nostream" :key "k")))
+    (should-not (utter--stream-kind b))
+    (should (equal (utter-request "x" :backend b :stream t :dry-run t)
+                   (utter-request "x" :backend b :dry-run t)))))
+
+(ert-deftest utter-openai-test-kokoro-stream-body ()
+  "Kokoro streams only when asked: :stream :false normally, t when streaming."
+  (let* ((b (utter-openai-test-kokoro "localhost:8880"))
+         (whole (utter-request "x" :backend b :dry-run t))
+         (stream (utter-request "x" :backend b :stream t :dry-run t)))
+    (should (eq (utter--stream-kind b) 'bytes))
+    (should (eq (plist-get (plist-get whole :body) :stream) :false))
+    (should-not (plist-member whole :stream))
+    (should (eq (plist-get (plist-get stream :body) :stream) t))
+    (should (eq (plist-get stream :stream) t))
+    (should (member "-N" (plist-get stream :curl-args)))))
+
+(ert-deftest utter-openai-test-stream-body-has-no-stream-format ()
+  "OpenAI streams raw audio as is; stream_format is never sent."
+  (let* ((b (utter-make-openai "OpenAI-stream" :key "k"
+              :capabilities '(instructions streaming)))
+         (d (utter-request "x" :backend b :stream t :dry-run t)))
+    (should (eq (plist-get d :stream) t))
+    (should-not (plist-member (plist-get d :body) :stream_format))
+    (should (equal (plist-get d :body)
+                   (plist-get (utter-request "x" :backend b :dry-run t) :body)))))
+
+(ert-deftest utter-openai-test-stream-end-to-end ()
+  "Kokoro streaming against a server that sends the audio in parts."
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-temp-dir dir
+    (let* ((frames (utter-test-mp3-frames 3))
+           (body (apply #'concat frames)))
+      (utter-test-server-with
+          (port `(("^/v1/audio/speech$" . (:headers (("Content-Type" . "audio/mpeg"))
+                                           :parts ,frames :delay 0.2))))
+        (let* ((utter-cache-directory dir)
+               (b (utter-openai-test-kokoro (format "127.0.0.1:%d" port)))
+               (res (utter-test-stream "你好" :backend b :voice "af_heart"))
+               (events (nth 2 res))
+               (sreq (car (utter-test-server-requests)))
+               (json (json-parse-string (plist-get sreq :body) :object-type 'plist)))
+          (should (car res))
+          (should (eq (plist-get json :stream) t))
+          (should-not (plist-member json :stream_format))
+          (should (equal (plist-get json :input) "你好"))
+          (should-not (utter-test-server-header sreq "Authorization"))
+          (should (equal (car events) '(:start :format mp3)))
+          (should (equal (car (last events)) '(:end)))
+          (should (> (cl-count :data events :key #'car) 1))
+          (should (equal (mapconcat #'cadr (cl-remove-if-not
+                                            (lambda (e) (eq (car e) :data)) events)
+                                    "")
+                         body))
+          (should (eq (plist-get (cadr res) :stream-started) t))
+          (should (equal (utter-test-file-bytes (car res)) body)))))))
+
 (ert-deftest utter-openai-test-mlx-voices-shape ()
   (should (equal (utter-openai--parse-voices
                   '((data ((id . "af_heart") (name . "Heart")) ((id . "zf_xiaobei")))))
