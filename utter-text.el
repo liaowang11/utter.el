@@ -253,6 +253,42 @@ Sentence ends inside FORBIDDEN intervals are ignored."
       (push (cons start (length text)) spans))
     (nreverse spans)))
 
+(defun utter--cjk-word-char-p (char)
+  "Return non-nil if CHAR is a CJK character that is a word by itself.
+Han, kana and Hangul word constituents qualify; CJK text has no
+spaces, so its characters are timed and highlighted one by one."
+  (and (or (<= #x4e00 char #x9fff) (<= #x3040 char #x30ff) (<= #xac00 char #xd7af))
+       (= (char-syntax char) ?w)))
+
+(defun utter--word-spans (text &optional beg end)
+  "Return the (BEG . END) spans of the words of TEXT from BEG to END.
+A word is a run of non-whitespace characters without its leading
+and trailing characters that are not word constituents in the
+current syntax table, so \"(fox),\" gives \"fox\", \"don't\" stays
+whole and punctuation alone gives nothing.  Each CJK character is
+a word of its own (`utter--cjk-word-char-p').  Offsets are
+positions in TEXT."
+  (let ((pos (or beg 0)) (end (or end (length text))) spans)
+    (while (and (< pos end) (string-match "[^ \t\n\r\f]+" text pos)
+                (< (match-beginning 0) end))
+      (let ((i (match-beginning 0)) (token-end (min end (match-end 0))))
+        (while (< i token-end)
+          (if (utter--cjk-word-char-p (aref text i))
+              (progn (push (cons i (1+ i)) spans)
+                     (setq i (1+ i)))
+            (let* ((j (or (cl-position-if #'utter--cjk-word-char-p text
+                                          :start i :end token-end)
+                          token-end))
+                   (b i) (e j))
+              (while (and (< b e) (/= (char-syntax (aref text b)) ?w))
+                (setq b (1+ b)))
+              (while (and (> e b) (/= (char-syntax (aref text (1- e))) ?w))
+                (setq e (1- e)))
+              (when (< b e) (push (cons b e) spans))
+              (setq i j))))
+        (setq pos token-end)))
+    (nreverse spans)))
+
 (defun utter--fit-end (text beg end max unit)
   "Return the largest P <= END with TEXT from BEG to P fitting MAX UNIT."
   (let ((n 0) (p beg))

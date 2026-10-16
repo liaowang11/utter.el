@@ -238,5 +238,36 @@
                (lambda (text _max _unit) (list (upcase text))))))
     (should (equal (utter--split "abc" 10) '("ABC")))))
 
+;;;; Word spans
+
+(defun utter-text-tests--words (text &optional beg end)
+  "Return the words of TEXT from BEG to END, by `utter--word-spans'."
+  (mapcar (lambda (span) (substring text (car span) (cdr span)))
+          (utter--word-spans text beg end)))
+
+(ert-deftest utter-text-word-spans-latin ()
+  (should (equal (utter-text-tests--words "The quick (brown) fox, don't stop -- well-known e.g. 3.14!")
+                 '("The" "quick" "brown" "fox" "don't" "stop" "well-known"
+                   "e.g" "3.14")))
+  (should (equal (utter--word-spans "  Hi, you.") '((2 . 4) (6 . 9))))
+  (should-not (utter--word-spans " ... -- !? "))
+  (should-not (utter--word-spans "")))
+
+(ert-deftest utter-text-word-spans-chinese-per-character ()
+  (should (equal (utter-text-tests--words "我们今天去北京。“长城”！")
+                 '("我" "们" "今" "天" "去" "北" "京" "长" "城"))))
+
+(ert-deftest utter-text-word-spans-mixed ()
+  (let ((text "我们今天去北京看长城。The quick fox. 日本語のテキストです。Emacs的包"))
+    (should (equal (utter-text-tests--words text)
+                   '("我" "们" "今" "天" "去" "北" "京" "看" "长" "城"
+                     "The" "quick" "fox"
+                     "日" "本" "語" "の" "テ" "キ" "ス" "ト" "で" "す"
+                     "Emacs" "的" "包")))
+    ;; BEG and END limit the scan; offsets stay those of TEXT.
+    (let ((beg (string-search "The" text)) (end (string-search " 日" text)))
+      (should (equal (utter-text-tests--words text beg end) '("The" "quick" "fox")))
+      (should (= (car (car (utter--word-spans text beg end))) beg)))))
+
 (provide 'utter-text-tests)
 ;;; utter-text-tests.el ends here
