@@ -66,7 +66,8 @@
 (cl-defun utter-make-elevenlabs
     (name &key (host "api.elevenlabs.io") (key #'utter-api-key-from-auth-source)
           curl-args request-params
-          (models '(eleven_multilingual_v2 eleven_v3 eleven_flash_v2_5)))
+          (models '(eleven_v4 eleven_v4_turbo eleven_multilingual_v2
+                   eleven_v3 eleven_flash_v2_5)))
   "Register and return an ElevenLabs backend called NAME.
 HOST is the API host.  KEY is a string, symbol or function; it
 defaults to auth-source by HOST.  CURL-ARGS are extra curl

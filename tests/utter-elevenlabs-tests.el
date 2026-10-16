@@ -35,7 +35,10 @@
     (should (eq (utter-backend-voices b) 'fetch))
     (should (equal (utter-backend-formats b) '(mp3 pcm)))
     (should (eq (utter-backend-key b) #'utter-api-key-from-auth-source))
-    (should (equal (utter-backend-host b) "api.elevenlabs.io"))))
+    (should (equal (utter-backend-host b) "api.elevenlabs.io"))
+    (should (equal (utter-backend-models b)
+                   '(eleven_v4 eleven_v4_turbo eleven_multilingual_v2
+                     eleven_v3 eleven_flash_v2_5)))))
 
 (ert-deftest utter-el-test-dry-run ()
   (let* ((utter--voice-cache (make-hash-table :test #'equal))
@@ -47,7 +50,7 @@
     (should (equal (plist-get d :headers)
                    '(("Content-Type" . "application/json") ("xi-api-key" . "[redacted]"))))
     (should (equal (plist-get d :body)
-                   '(:text "Hello" :model_id "eleven_multilingual_v2"
+                   '(:text "Hello" :model_id "eleven_v4"
                      :voice_settings (:speed 1.1)
                      :previous_text "Before." :next_text "After.")))
     (should-not (string-search "xi-secret" (format "%S" d)))
@@ -57,14 +60,20 @@
                      (concat "https://api.elevenlabs.io/v1/text-to-speech/"
                              utter-elevenlabs-default-voice-id "/with-timestamps?output_format=pcm_24000")))
       (should (equal (plist-get d :body)
-                     '(:text "Hi" :model_id "eleven_multilingual_v2" :voice_settings (:speed 1.2)))))
+                     '(:text "Hi" :model_id "eleven_v4" :voice_settings (:speed 1.2)))))
     ;; language_code is sent to models that accept it
     (should (equal (plist-get (plist-get (utter-request "Hi" :backend b :model 'eleven_v3 :language "zh"
                                                         :dry-run t)
                                          :body)
                               :language_code)
                    "zh"))
-    (should-not (plist-member (plist-get (utter-request "Hi" :backend b :language "zh" :dry-run t) :body)
+    (should (equal (plist-get (plist-get (utter-request "Hi" :backend b :language "zh" :dry-run t)
+                                         :body)
+                              :language_code)
+                   "zh"))
+    (should-not (plist-member (plist-get (utter-request "Hi" :backend b :model 'eleven_multilingual_v2
+                                                        :language "zh" :dry-run t)
+                                         :body)
                               :language_code))))
 
 (ert-deftest utter-el-test-voice-name-to-id ()

@@ -143,7 +143,7 @@ return the backend):
                    (formats '(mp3 wav opus aac flac pcm)) (max-chars 4096)
                    (capabilities '(instructions)) (instructions-key :instructions))
 (utter-make-elevenlabs NAME &key (host "api.elevenlabs.io") key curl-args request-params
-                       (models '(eleven_multilingual_v2 eleven_v3 eleven_flash_v2_5)))
+                       (models '(eleven_v4 eleven_v4_turbo eleven_multilingual_v2 eleven_v3 eleven_flash_v2_5)))
 ```
 
 Default `header` for cloud constructors is `Authorization: Bearer KEY`,
