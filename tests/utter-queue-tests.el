@@ -852,6 +852,205 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
         (should (= (point) 1))
         (utter-stop)))))
 
+(defun utter-eng--word-alignment (text &optional step)
+  "Return an alignment for TEXT where word N starts at N times STEP seconds."
+  (let ((starts (make-vector (length text) 0.0))
+        (ends (make-vector (length text) 0.0))
+        (n 0))
+    (dolist (span (utter--word-spans text))
+      (cl-loop for i from (car span) below (length text)
+               do (aset starts i (* n (or step 0.15))))
+      (cl-incf n))
+    (cl-loop for i below (length text) do (aset ends i (+ (aref starts i) 0.1)))
+    (list :characters text :starts starts :ends ends)))
+
+(defun utter-eng--deliver (item alignment)
+  "Answer the first fake request of ITEM with ALIGNMENT."
+  (ignore item)
+  (funcall (utter-eng-req-callback (car utter-eng--requests)) utter-eng--audio-file
+           (list :format 'wav :alignment alignment)))
+
+(defun utter-eng--overlay-text (ov)
+  "Return the buffer text under overlay OV, or nil."
+  (and (overlayp ov) (overlay-buffer ov)
+       (buffer-substring-no-properties (overlay-start ov) (overlay-end ov))))
+
+(ert-deftest utter-queue-highlight-t-is-sentence-unchanged ()
+  (let (events)
+    (utter-eng-with-queue ((utter-highlight t)
+                           (utter-eng--auto nil)
+                           (utter-eng--play-seconds "3")
+                           (utter-progress-functions
+                            (list #'utter--highlight-progress
+                                  (lambda (_item start end) (push (cons start end) events)))))
+      (utter-eng-with-source "Hello Bill. This is a test."
+        (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                    :source-buffer (current-buffer)))
+               (seg (car (utter--item-segments item))))
+          (utter-eng--deliver item (utter-eng--word-alignment (utter-item-text item) 0.1))
+          ;; One cue per sentence; the sentence markers repeat the cue's own.
+          (should (= (length (utter--segment-cues seg)) 2))
+          (dolist (cue (utter--segment-cues seg))
+            (should (= (length cue) 7))
+            (should (eq (aref cue 3) (aref cue 5)))
+            (should (eq (aref cue 4) (aref cue 6))))
+          (should (equal (utter-eng--overlay-text utter--highlight-overlay) "Hello Bill. "))
+          (should (eq (overlay-get utter--highlight-overlay 'face) 'utter-highlight))
+          (should (utter-eng--wait
+                   (lambda () (equal (utter-eng--overlay-text utter--highlight-overlay)
+                                     "This is a test."))))
+          (should (equal (reverse events) '((0 . 12) (12 . 27))))
+          (should-not (utter-eng--overlay-text utter--highlight-word-overlay))
+          (utter-stop))))))
+
+(ert-deftest utter-queue-highlight-word-two-overlays ()
+  (let (events)
+    (utter-eng-with-queue ((utter-highlight 'word)
+                           (utter-eng--auto nil)
+                           (utter-eng--play-seconds "3")
+                           (utter-progress-functions
+                            (list #'utter--highlight-progress
+                                  (lambda (_item start end) (push (cons start end) events)))))
+      (utter-eng-with-source "Hello Bill. This is a test."
+        (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                    :source-buffer (current-buffer)))
+               (seg (car (utter--item-segments item))))
+          ;; The mode is captured with the utterance, like its markers.
+          (setq utter-highlight t)
+          (utter-eng--deliver item (utter-eng--word-alignment (utter-item-text item)))
+          (should (= (length (utter--segment-cues seg)) 6))
+          (should (equal (utter-eng--overlay-text utter--highlight-word-overlay) "Hello"))
+          (should (eq (overlay-get utter--highlight-word-overlay 'face) 'utter-highlight))
+          (should (equal (utter-eng--overlay-text utter--highlight-overlay) "Hello Bill. "))
+          (should (eq (overlay-get utter--highlight-overlay 'face) 'utter-highlight-sentence))
+          (should (> (overlay-get utter--highlight-word-overlay 'priority)
+                     (or (overlay-get utter--highlight-overlay 'priority) 0)))
+          (should (utter-eng--wait
+                   (lambda () (equal (utter-eng--overlay-text utter--highlight-word-overlay)
+                                     "This"))))
+          (should (equal (utter-eng--overlay-text utter--highlight-overlay) "This is a test."))
+          (should (equal (seq-take (reverse events) 3) '((0 . 5) (6 . 10) (12 . 16))))
+          (should (= (point) 1))
+          ;; An edit drops both overlays and every cue marker.
+          (let ((cue (car (utter--segment-cues seg))))
+            (goto-char (point-max))
+            (insert " Edit.")
+            (should-not utter--highlight-overlay)
+            (should-not utter--highlight-word-overlay)
+            (dotimes (i 4)
+              (should-not (marker-buffer (aref cue (+ 3 i))))))
+          (utter-stop))))))
+
+(ert-deftest utter-queue-highlight-word-cjk-per-character ()
+  (utter-eng-with-queue ((utter-highlight 'word)
+                         (utter-eng--auto nil)
+                         (utter-eng--play-seconds "3"))
+    (utter-eng-with-source "前言。我们去北京。"
+      (let* ((beg (1+ (string-search "我" (buffer-string))))
+             (item (utter-enqueue (utter--buffer-text beg (point-max))
+                                  :source-buffer (current-buffer)))
+             (seg (car (utter--item-segments item))))
+        (utter-eng--deliver item (utter-eng--word-alignment (utter-item-text item)))
+        (should (equal (mapcar (lambda (cue)
+                                 (list (buffer-substring (aref cue 3) (aref cue 4))
+                                       (buffer-substring (aref cue 5) (aref cue 6))))
+                               (utter--segment-cues seg))
+                       '(("我" "我们去北京。") ("们" "我们去北京。") ("去" "我们去北京。")
+                         ("北" "我们去北京。") ("京" "我们去北京。"))))
+        (should (equal (utter-eng--overlay-text utter--highlight-word-overlay) "我"))
+        (should (utter-eng--wait
+                 (lambda () (equal (utter-eng--overlay-text utter--highlight-word-overlay)
+                                   "们"))))
+        (utter-stop)))))
+
+(ert-deftest utter-queue-highlight-word-falls-back-to-sentence-when-alignment-mismatch ()
+  (utter-eng-with-queue ((utter-highlight 'word)
+                         (utter-eng--auto nil)
+                         (utter-eng--play-seconds "3"))
+    ;; The URL is spoken as "link", which is not in the buffer, so the
+    ;; first sentence gets a sentence cue and the second word cues.
+    (utter-eng-with-source "Visit https://example.org now. Next sentence."
+      (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                  :source-buffer (current-buffer)))
+             (seg (car (utter--item-segments item))))
+        (utter-eng--deliver item (utter-eng--word-alignment (utter-item-text item)))
+        (should (equal (mapcar (lambda (cue) (buffer-substring (aref cue 3) (aref cue 4)))
+                               (utter--segment-cues seg))
+                       '("Visit https://example.org now. " "Next" "sentence")))
+        ;; A sentence cue in word mode looks exactly like `t'.
+        (should (equal (utter-eng--overlay-text utter--highlight-overlay)
+                       "Visit https://example.org now. "))
+        (should (eq (overlay-get utter--highlight-overlay 'face) 'utter-highlight))
+        (should-not (utter-eng--overlay-text utter--highlight-word-overlay))
+        (should (utter-eng--wait
+                 (lambda () (equal (utter-eng--overlay-text utter--highlight-word-overlay)
+                                   "Next"))))
+        (should (eq (overlay-get utter--highlight-overlay 'face) 'utter-highlight-sentence))
+        (utter-stop)))
+    ;; Timings for other text give segment-level highlighting.
+    (utter-eng-with-source "Hello Bill. This is a test."
+      (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                  :source-buffer (current-buffer)))
+             (seg (car (utter--item-segments item)))
+             (utter-eng--requests (last utter-eng--requests)))
+        (utter-eng--deliver item (utter-eng--word-alignment "Something else entirely."))
+        (should-not (utter--segment-cues seg))
+        (should (utter-eng--wait (lambda () (eq (utter-eng--status) 'playing))))
+        (should (equal (utter-eng--overlay-text utter--highlight-overlay)
+                       "Hello Bill. This is a test."))
+        (should (eq (overlay-get utter--highlight-overlay 'face) 'utter-highlight))
+        (should-not (utter-eng--overlay-text utter--highlight-word-overlay))
+        (utter-stop)))))
+
+(ert-deftest utter-queue-highlight-word-cue-lookup-by-range ()
+  (utter-eng-with-queue ((utter-highlight 'word)
+                         (utter-eng--auto nil)
+                         (utter-eng--play-seconds "3"))
+    (utter-eng-with-source "Hello Bill. This is a test."
+      (let ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                 :source-buffer (current-buffer))))
+        (utter-eng--deliver item (utter-eng--word-alignment (utter-item-text item) 100))
+        (should (equal (utter-eng--overlay-text utter--highlight-word-overlay) "Hello"))
+        ;; An offset inside "Bill" finds its cue, not only its start.
+        (utter--highlight-progress item 8 nil)
+        (should (equal (utter-eng--overlay-text utter--highlight-word-overlay) "Bill"))
+        (utter--highlight-progress item 15 nil)
+        (should (equal (utter-eng--overlay-text utter--highlight-word-overlay) "This"))
+        (should (equal (utter-eng--overlay-text utter--highlight-overlay) "This is a test."))
+        (utter-stop)))))
+
+(ert-deftest utter-queue-highlight-progress-start-is-restartable ()
+  (let (events)
+    (utter-eng-with-queue ((utter-highlight 'word)
+                           (utter-eng--auto nil)
+                           (utter-eng--play-seconds "3")
+                           (utter-progress-functions
+                            (list #'utter--highlight-progress
+                                  (lambda (_item start _end) (push start events)))))
+      (utter-eng-with-source "Hello Bill. This is a test."
+        (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                    :source-buffer (current-buffer)))
+               (seg (car (utter--item-segments item))))
+          (utter-eng--deliver item (utter-eng--word-alignment (utter-item-text item) 100))
+          (let* ((proc (utter--qstate-process utter--queue))
+                 (timer (process-get proc 'utter-progress-timer))
+                 (cues (utter--segment-cues seg)))
+            (should timer)
+            ;; Starting again keeps the one timer and fires nothing new.
+            (utter--progress-start proc)
+            (should (eq (process-get proc 'utter-progress-timer) timer))
+            (should (equal events '(0)))
+            ;; A cue appended during playback is reached: keep only the
+            ;; first cue, then append the "Bill" cue, already due.
+            (let ((late (nth 1 cues)))
+              (setcdr cues nil)
+              (aset late 0 0.0)
+              (nconc cues (list late)))
+            (utter--progress-start proc)
+            (should (equal events '(6 0)))
+            (should (eq (process-get proc 'utter-progress-timer) timer))
+            (utter-stop)))))))
+
 (ert-deftest utter-queue-item-private-accessors ()
   (utter-eng-with-queue ((utter-eng--auto nil))
     (let ((item (utter-enqueue "Private.")))

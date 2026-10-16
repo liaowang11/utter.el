@@ -112,7 +112,13 @@ The result is passed as :context to backends that have the
 `stitching' capability.")
 
 (defface utter-highlight '((t :inherit highlight))
-  "Face for the text being spoken, when `utter-highlight' is on."
+  "Face for the text being spoken, when `utter-highlight' is on.
+With `utter-highlight' set to `word' it marks the current word."
+  :group 'utter)
+
+(defface utter-highlight-sentence '((t :inherit secondary-selection))
+  "Face for the sentence around the spoken word.
+Used when `utter-highlight' is `word' and the word is known."
   :group 'utter)
 
 ;;;; Data
@@ -426,7 +432,9 @@ when the tags did not survive preprocessing."
      :id (cl-incf utter--item-counter)
      :text plain
      :status 'pending
-     :params resolved
+     :params (if (and utter-highlight buffer)
+                 (append resolved (list :highlight utter-highlight))
+               resolved)
      :source-buffer buffer
      :source-name (or (plist-get params :source-name)
                       (and buffer (buffer-name buffer))
@@ -592,7 +600,14 @@ Other utterances stay; a message says why."
 ;;;; Highlight
 
 (defvar utter--highlight-overlay nil
-  "The overlay on the text being spoken, when highlighting.")
+  "The overlay on the sentence or segment being spoken, when highlighting.")
+
+(defvar utter--highlight-word-overlay nil
+  "The overlay on the word being spoken, when `utter-highlight' is `word'.")
+
+(defun utter--highlight-mode (item)
+  "Return the `utter-highlight' value captured with ITEM: t or `word'."
+  (if (eq (plist-get (utter-item-params item) :highlight) 'word) 'word t))
 
 (defun utter--progress-stop (proc)
   "Cancel the sentence progress timer attached to PROC."
@@ -603,9 +618,11 @@ Other utterances stay; a message says why."
 
 (defun utter--sentence-cues (item seg alignment)
   "Map SEG's sentence boundaries and ALIGNMENT to source markers in ITEM.
-Each cue is [SECONDS START END BEG-MARKER END-MARKER].  START and
-END are offsets in the processed item text.  Return nil if source
-positions or matching character timings are unavailable."
+Each cue is [SECONDS START END BEG END SENT-BEG SENT-END]: START
+and END are offsets in the processed item text, BEG and END
+markers in the source, and SENT-BEG and SENT-END the same markers
+again.  Return nil if source positions or matching character
+timings are unavailable."
   (when-let* (((not (utter--highlight-stale-p item)))
               (piece (utter--segment-source-text seg))
               ((equal (plist-get alignment :characters) (utter--segment-text seg)))
@@ -621,12 +638,77 @@ positions or matching character timings are unavailable."
                  (cl-every #'identity positions))
         (cl-loop for span in spans
                  for (pos . rest) on positions
-                 collect (vector (aref starts (utter--skip-space piece (car span)))
-                                 (+ (utter--segment-start seg) (car span))
-                                 (+ (utter--segment-start seg) (cdr span))
-                                 (with-current-buffer buffer (copy-marker pos))
-                                 (with-current-buffer buffer
-                                   (copy-marker (or (car rest) (cdr bounds))))))))))
+                 collect
+                 (let ((beg (with-current-buffer buffer (copy-marker pos)))
+                       (end (with-current-buffer buffer
+                              (copy-marker (or (car rest) (cdr bounds))))))
+                   (vector (aref starts (utter--skip-space piece (car span)))
+                           (+ (utter--segment-start seg) (car span))
+                           (+ (utter--segment-start seg) (cdr span))
+                           beg end beg end)))))))
+
+(defun utter--word-source (piece beg end from bound)
+  "Return the source position of the word from BEG to END in PIECE.
+Position tags mark only the start of each run of non-space text,
+so count from the nearest tag at or before BEG, and use the result
+when the current buffer holds the word there.  Else search for the
+word from FROM up to BOUND.  Return nil if neither finds it, for
+example when preprocessing rewrote the word."
+  (let ((word (substring-no-properties piece beg end))
+        (i beg) tag)
+    (while (and (>= i 0) (not (setq tag (get-text-property i 'utter--pos piece))))
+      (setq i (1- i)))
+    (let ((pos (and tag (+ tag (- beg i)))))
+      (if (and pos (<= from pos) (<= (+ pos (length word)) bound)
+               (string= (buffer-substring-no-properties pos (+ pos (length word)))
+                        word))
+          pos
+        (save-excursion
+          (goto-char from)
+          (let ((case-fold-search nil))
+            (and (search-forward word bound t) (match-beginning 0))))))))
+
+(defun utter--word-cues (item seg alignment)
+  "Return word cues for SEG of ITEM from ALIGNMENT.
+Cues have the shape of `utter--sentence-cues', one per word of
+`utter--word-spans': BEG and END mark the word, SENT-BEG and
+SENT-END its sentence.  A sentence whose words are not all found
+in the source keeps its sentence cue.  Return nil when there are
+no sentence cues."
+  (when-let* ((sentences (utter--sentence-cues item seg alignment)))
+    (let ((piece (utter--segment-source-text seg))
+          (offset (utter--segment-start seg))
+          (starts (plist-get alignment :starts)))
+      (with-current-buffer (utter-item-source-buffer item)
+        (cl-loop
+         for cue in sentences
+         for sbeg = (aref cue 5)
+         for send = (aref cue 6)
+         for words = (utter--word-spans piece (- (aref cue 1) offset)
+                                        (- (aref cue 2) offset))
+         for positions = (let ((from (marker-position sbeg)) found)
+                           (cl-loop for (b . e) in words
+                                    for pos = (utter--word-source
+                                               piece b e from (marker-position send))
+                                    while pos
+                                    do (push pos found)
+                                    (setq from (+ pos (- e b))))
+                           (nreverse found))
+         if (and words (= (length positions) (length words)))
+         append (cl-loop for (b . e) in words
+                         for pos in positions
+                         collect (vector (aref starts b) (+ offset b) (+ offset e)
+                                         (copy-marker pos) (copy-marker (+ pos (- e b)))
+                                         sbeg send))
+         else collect cue)))))
+
+(defun utter--highlight-cues (item seg alignment)
+  "Return the timing cues for SEG of ITEM from ALIGNMENT, or nil.
+Word cues when ITEM was queued with `utter-highlight' set to
+`word', else sentence cues."
+  (if (eq (utter--highlight-mode item) 'word)
+      (utter--word-cues item seg alignment)
+    (utter--sentence-cues item seg alignment)))
 
 (defun utter--progress-tick (proc)
   "Advance the sentence highlight to PROC's current audio position.
@@ -656,19 +738,28 @@ Use the player's captured rate and exclude paused wall time."
                               (aref cue 1) (aref cue 2))))))))
 
 (defun utter--progress-start (proc)
-  "Start sentence progress tracking for PROC when timing cues exist."
-  (utter--progress-stop proc)
+  "Start progress tracking for PROC when timing cues exist.
+Calling it again, for example after cues were appended to the
+segment, catches up at once and keeps the running timer."
   (when (utter--segment-cues (process-get proc 'utter-segment))
     (utter--progress-tick proc)
-    (when (utter-item-markers (utter--qstate-current utter--queue))
+    (when (and (utter-item-markers (utter--qstate-current utter--queue))
+               (not (process-get proc 'utter-progress-timer)))
       (process-put proc 'utter-progress-timer
                    (run-at-time 0.05 0.05 #'utter--progress-tick proc)))))
 
+(defun utter--highlight-delete-word ()
+  "Remove the word highlight overlay."
+  (when (overlayp utter--highlight-word-overlay)
+    (delete-overlay utter--highlight-word-overlay))
+  (setq utter--highlight-word-overlay nil))
+
 (defun utter--highlight-delete ()
-  "Remove the highlight overlay."
+  "Remove the highlight overlays."
   (when (overlayp utter--highlight-overlay)
     (delete-overlay utter--highlight-overlay))
-  (setq utter--highlight-overlay nil))
+  (setq utter--highlight-overlay nil)
+  (utter--highlight-delete-word))
 
 (defun utter--highlight-drop (item)
   "Forget the markers of ITEM and remove its highlight."
@@ -680,8 +771,7 @@ Use the player's captured rate and exclude paused wall time."
     (when m (set-marker (car m) nil) (set-marker (cdr m) nil)))
   (dolist (seg (utter--item-segments item))
     (dolist (cue (utter--segment-cues seg))
-      (set-marker (aref cue 3) nil)
-      (set-marker (aref cue 4) nil))
+      (dotimes (i 4) (set-marker (aref cue (+ 3 i)) nil)))
     (setf (utter--segment-cues seg) nil
           (utter--segment-source-text seg) nil))
   (setf (utter-item-markers item) nil)
@@ -707,25 +797,47 @@ Use the player's captured rate and exclude paused wall time."
                    (utter--qstate-items utter--queue))
     (remove-hook 'after-change-functions #'utter--highlight-after-change t)))
 
+(defun utter--highlight-move (overlay beg end buffer face &optional priority)
+  "Move OVERLAY, or a new one, to BEG..END in BUFFER and show it in FACE.
+PRIORITY is its overlay priority.  Return the overlay."
+  (if (overlayp overlay)
+      (move-overlay overlay beg end buffer)
+    (setq overlay (make-overlay beg end buffer))
+    (overlay-put overlay 'utter t))
+  (overlay-put overlay 'face face)
+  (overlay-put overlay 'priority priority)
+  overlay)
+
 (defun utter--highlight-progress (item start _end)
-  "Move the highlight to the part of ITEM at processed text offset START."
+  "Move the highlight to the part of ITEM at processed text offset START.
+The cue whose range holds START gives the sentence, or for a word
+cue the word in `utter-highlight' and its sentence in
+`utter-highlight-sentence'.  Without a cue the segment is shown."
   (when (and (utter-item-p item) (utter-item-markers item))
     (if (utter--highlight-stale-p item)
         (utter--highlight-drop item)
       (let* ((seg (nth (utter--item-position item) (utter--item-segments item)))
-             (cue (cl-find start (utter--segment-cues seg)
-                           :key (lambda (c) (aref c 1))))
+             (cue (cl-find-if (lambda (c) (and (<= (aref c 1) start) (< start (aref c 2))))
+                              (utter--segment-cues seg)))
+             ;; Sentence cues repeat their own markers; word cues do not.
+             (word (and cue (not (eq (aref cue 3) (aref cue 5)))))
              (m (nth (utter--item-position item) (utter-item-markers item)))
              (beg (if cue (aref cue 3) (car m)))
              (end (if cue (aref cue 4) (cdr m)))
              (buf (utter-item-source-buffer item)))
         (if (not beg)
             (utter--highlight-delete)
-          (if (overlayp utter--highlight-overlay)
-              (move-overlay utter--highlight-overlay beg end buf)
-            (setq utter--highlight-overlay (make-overlay beg end buf))
-            (overlay-put utter--highlight-overlay 'face 'utter-highlight)
-            (overlay-put utter--highlight-overlay 'utter t))
+          (setq utter--highlight-overlay
+                (utter--highlight-move utter--highlight-overlay
+                                       (if word (aref cue 5) beg)
+                                       (if word (aref cue 6) end)
+                                       buf
+                                       (if word 'utter-highlight-sentence 'utter-highlight)))
+          (if word
+              (setq utter--highlight-word-overlay
+                    (utter--highlight-move utter--highlight-word-overlay
+                                           beg end buf 'utter-highlight 1))
+            (utter--highlight-delete-word))
           (with-current-buffer buf
             (add-hook 'after-change-functions #'utter--highlight-after-change nil t))
           (when utter-highlight-follow
@@ -775,7 +887,7 @@ Use the player's captured rate and exclude paused wall time."
             (utter--segment-duration seg) (plist-get info :duration)
             (utter--segment-cues seg)
             (condition-case nil
-                (utter--sentence-cues item seg (plist-get info :alignment))
+                (utter--highlight-cues item seg (plist-get info :alignment))
               (error nil))
             (utter--segment-status seg) 'ready))
      ((eq audio 'abort)
