@@ -68,16 +68,20 @@ backend; define one.
   ;; OpenAI.  The key comes from auth-source for api.openai.com.
   (setq utter-backend (utter-make-openai "OpenAI"))
 
-  ;; Kokoro-FastAPI on this machine: same protocol, no key.
+  ;; Kokoro-FastAPI on this machine: same protocol, no key.  Whole audio
+  ;; needs :stream :false; the stream params and capability let it play
+  ;; as it arrives when `utter-streaming' is on.
   (utter-make-openai "Kokoro"
     :host "localhost:8880" :protocol "http"
     :models '(kokoro)
     :voices '("af_heart" "zf_xiaobei")
     :formats '(mp3 wav)
-    :request-params '(:stream :false))
+    :request-params '(:stream :false)
+    :stream-params '(:stream t) :capabilities '(streaming))
 
   ;; ElevenLabs and xAI.  Voices are fetched from the API when you pick one.
-  (utter-make-elevenlabs "ElevenLabs")
+  ;; :streaming t lets ElevenLabs stream when `utter-streaming' is on.
+  (utter-make-elevenlabs "ElevenLabs" :streaming t)
   (utter-make-xai "xAI")
 
   ;; Gemini `/v1beta/interactions'.

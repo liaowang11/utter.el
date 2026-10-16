@@ -40,8 +40,8 @@ body predates the corrections applied here).
 |---|---|---|---|
 | `utter-core.el` | CORE | backend struct, generics, key lookup, curl runner, decoders, `utter-request`, `utter-fetch-json`, cache | cl-lib, auth-source, json |
 | `utter-say.el` | CORE | macOS `say` backend (`process` kind) | core |
-| `utter-openai.el` | CORE | OpenAI-compatible `/v1/audio/speech` backend (OpenAI, OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI…) | core |
-| `utter-elevenlabs.el` | CORE | ElevenLabs backend (b64-json with alignment; voices fetched) | core |
+| `utter-openai.el` | CORE | OpenAI-compatible `/v1/audio/speech` backend (OpenAI, OpenRouter, Kokoro-FastAPI, mlx-audio, LocalAI…; `bytes` stream with the `streaming` capability) | core |
+| `utter-elevenlabs.el` | CORE | ElevenLabs backend (b64-json with alignment; voices fetched; opt-in `b64-lines` stream) | core |
 | `utter-gemini.el` | CORE, optional | Gemini `/v1beta/interactions` (b64-json WAV) | core |
 | `utter-xai.el` | CORE, optional | xAI `/v1/tts` grok-tts (b64-json mp3/wav with alignment; voices fetched from `/v1/tts/voices`) | core |
 | `utter-text.el` | ENGINE | preprocessing, sentence splitting into segments (private) | core (for `max-chars`) |
@@ -182,8 +182,10 @@ return the backend):
                                              (tts-1-hd :voices TTS-1-VOICES)))
                    (voices '("alloy" ... "shimmer" "ballad" "verse" "marin" "cedar"))
                    (formats '(mp3 wav opus aac flac pcm)) (max-chars 4096)
-                   (capabilities '(instructions)) (instructions-key :instructions))
+                   (capabilities '(instructions)) (instructions-key :instructions)
+                   stream-params)                          ; merged into a streamed body
 (utter-make-elevenlabs NAME &key (host "api.elevenlabs.io") key curl-args request-params
+                       streaming                           ; t adds the streaming capability
                        (models '(eleven_v4 eleven_v4_turbo eleven_multilingual_v2 eleven_v3 eleven_flash_v2_5)))
 ```
 
@@ -195,6 +197,16 @@ that rename keys (mlx-audio `instruct`). Known vendor quirks live in
 `utter-openai.el` as documented presets of keyword args, not hidden logic:
 OpenRouter needs `response_format` forced to `"mp3"`, Kokoro-FastAPI needs
 `:stream :false`.
+
+Streaming is opt-in per backend. `utter-openai` streams (`bytes`) when
+its backend-level `capabilities` contain `streaming`; `stream-params` is
+merged into the body after `request-params` (Kokoro-FastAPI:
+`:request-params '(:stream :false) :stream-params '(:stream t)`), and
+`stream_format` is never sent. `utter-make-elevenlabs :streaming t` adds
+`streaming`; a streamed request goes to
+`/v1/text-to-speech/ID/stream/with-timestamps` (`b64-lines`), whose
+pieces come from `alignment`, never `normalized_alignment`; a null
+alignment is no piece. Unary URLs and bodies are unchanged.
 
 ### Text (ENGINE, private except the two hooks)
 
