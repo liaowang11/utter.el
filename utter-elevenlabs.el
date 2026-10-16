@@ -32,6 +32,13 @@
 ;;
 ;;   (utter-make-elevenlabs "ElevenLabs"
 ;;     :models '(eleven_multilingual_v2 eleven_v3))
+;;
+;; With :streaming t a request made with :stream goes to
+;; .../VOICE_ID/stream/with-timestamps, which answers with one JSON
+;; object per line, each with some base64 audio and the timing of the
+;; characters it covers (absolute times; the first line often has
+;; none).  Audio plays as it arrives and highlighting follows the
+;; timing.
 
 ;;; Code:
 
@@ -55,17 +62,19 @@
     `(("xi-api-key" . ,key))))
 
 (defun utter-elevenlabs--url (backend info)
-  "Return the synthesis URL for BACKEND and request INFO."
-  (format "%s://%s/v1/text-to-speech/%s/with-timestamps?output_format=%s"
+  "Return the synthesis URL for BACKEND and request INFO.
+A streamed request (INFO has :stream) uses /stream/with-timestamps."
+  (format "%s://%s/v1/text-to-speech/%s/%swith-timestamps?output_format=%s"
           (or (utter-backend-protocol backend) "https")
           (utter-backend-host backend)
           (url-hexify-string (or (plist-get info :voice-id) utter-elevenlabs-default-voice-id))
+          (if (plist-get info :stream) "stream/" "")
           (if (eq (plist-get info :format) 'pcm) "pcm_24000" "mp3_44100_128")))
 
 ;;;###autoload
 (cl-defun utter-make-elevenlabs
     (name &key (host "api.elevenlabs.io") (key #'utter-api-key-from-auth-source)
-          curl-args request-params
+          curl-args request-params streaming
           (models '(eleven_v4 eleven_v4_turbo eleven_multilingual_v2
                    eleven_v3 eleven_flash_v2_5)))
   "Register and return an ElevenLabs backend called NAME.
@@ -73,14 +82,16 @@ HOST is the API host.  KEY is a string, symbol or function; it
 defaults to auth-source by HOST.  CURL-ARGS are extra curl
 arguments and REQUEST-PARAMS a plist merged last into the body,
 e.g. (:voice_settings (:speed 1.0 :stability 0.5)).  MODELS lists
-model ids; the first is the default."
+model ids; the first is the default.  STREAMING non-nil adds the
+`streaming' capability: with `utter-streaming' on, audio plays as
+it arrives from /stream/with-timestamps."
   (declare (indent 1))
   (setf (utter-get-backend name)
         (utter--make-elevenlabs
          :name name :host host :protocol "https" :key key
          :models models :formats '(mp3 pcm) :max-chars 5000
          :response-kind 'b64-json :response-path '(audio_base64)
-         :capabilities '(stitching timestamps)
+         :capabilities (append '(stitching timestamps) (and streaming '(streaming)))
          :curl-args curl-args :request-params request-params
          :voices 'fetch
          :header #'utter-elevenlabs--header
@@ -128,6 +139,19 @@ taken as an id.  nil gives `utter-elevenlabs-default-voice-id'."
          (ends (and alignment (alist-get 'character_end_times_seconds alignment))))
     (when characters
       (utter--normalize-alignment (plist-get info :text) characters starts ends))))
+
+(cl-defmethod utter--stream-kind ((backend utter-elevenlabs))
+  "Return `b64-lines' when BACKEND has the `streaming' capability."
+  (and (memq 'streaming (utter-backend-capabilities backend)) 'b64-lines))
+
+(cl-defmethod utter--stream-alignment-piece ((_backend utter-elevenlabs) _info json)
+  "Return the original alignment piece of one streamed JSON line, or nil.
+The `normalized_alignment' field is ignored; a null alignment gives nil."
+  (when-let* ((alignment (alist-get 'alignment json))
+              (characters (alist-get 'characters alignment)))
+    (list :characters characters
+          :starts (alist-get 'character_start_times_seconds alignment)
+          :ends (alist-get 'character_end_times_seconds alignment))))
 
 (cl-defmethod utter--list-voices ((backend utter-elevenlabs) callback)
   "Fetch BACKEND's voices from GET /v2/voices and call CALLBACK.
