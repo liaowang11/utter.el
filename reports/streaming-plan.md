@@ -296,3 +296,16 @@ C1. Faces: `utter-highlight` stays the face of the highlighted text in sentence
     overlay priority on the word.
 C2. `utter-progress-functions` firing per word is accepted; WP-A checks that
     utter-mode's header-line consumer stays cheap and notes it in its report.
+
+## Coordinator decisions (wave 2)
+
+W1. xAI streaming is dropped for now: WP-E is deferred. xAI keeps its unary
+    request; no `websocket` dependency, no Makefile change. The core's
+    `websocket` kind stays as dormant groundwork.
+W2. The request layer as built differs from contract 4.A/4.B in the ways
+    listed in reports/stream-core.md ("contract deviations"); that report
+    wins over this plan where they differ. In particular: curl runs with
+    `-N`; audio goes to temp files and the output file appears only at the
+    end; a request asked to stream may finish without any events
+    (`:stream-started` nil) and must then be treated as whole audio.
+W3. Wave 2 runs WP-C and WP-D concurrently.
