@@ -16,7 +16,8 @@ body predates the corrections applied here).
    re-read from the buffer. One global queue. Point never moves, windows
    never recenter, no buffer pops up. The only default indicator is a short
    lighter in `global-mode-string`. Completion and errors use `message`.
-3. **Highlight is opt-in and off by default** (`utter-highlight`). It is
+3. **Highlight is opt-in and off by default** (`utter-highlight`: nil,
+   t for the sentence, `word` for the word inside its sentence). It is
    dropped as soon as the source buffer changes after capture.
 4. **Header line and local keys exist only inside `utter-mode`**, which is
    auto-enabled only in the queue buffer. Ordinary buffers never get either.
@@ -253,7 +254,25 @@ must match the request text and have finite, nonnegative, ordered start/end
 values. Invalid/missing metadata leaves audio playable with segment-level
 highlighting; Gemini and other untimed backends also use segment markers.
 
-A process-owned 50 ms timer advances sentence cues through
+The mode is captured per utterance (`:highlight` in the item params).
+With `t` one overlay in `utter-highlight` covers the sentence. With
+`word` the word gets `utter-highlight` (overlay priority 1) and its
+sentence `utter-highlight-sentence` (`:inherit secondary-selection`).
+Words come from `utter--word-spans`: whitespace-separated runs trimmed
+of leading/trailing non-word characters under the source syntax table,
+so punctuation alone is no word; each CJK character (Han, kana, Hangul)
+is a word of its own. A word maps to the buffer by counting from the
+nearest position tag, checked against the buffer text, else by a search
+within its sentence; a sentence with an unmatched word (a URL spoken as
+"link", a pronunciation rewrite) keeps one sentence cue and looks
+exactly like `t`. Each cue is `[SECONDS START END BEG END SENT-BEG
+SENT-END]` (markers; sentence cues repeat BEG/END as SENT-BEG/SENT-END),
+and `utter--highlight-progress` picks the cue whose `[START,END)` holds
+the START it is given. Cues may be appended (`nconc`) during playback;
+`utter--progress-start` is idempotent and catches up on new cues.
+`utter-progress-functions` fires per word in `word` mode.
+
+A process-owned 50 ms timer advances sentence or word cues through
 `utter-progress-functions`, using elapsed time, the captured playback rate,
 and accumulated pause time. Restart-on-resume players transfer the current
 cue position. Player exit, stop, source edits and queue reset cancel timing
@@ -290,7 +309,7 @@ sizes toward the limit, and removes orphan alignment files.
 | `utter-playback-rate` | 1.0 (player-side) |
 | `utter-language` | `auto` |
 | `utter-instructions` | nil |
-| `utter-highlight`, `utter-highlight-follow` | nil, nil |
+| `utter-highlight`, `utter-highlight-follow` | nil (or t sentence, `word`), nil |
 | `utter-lighter` | `" ♪%i/%n"` |
 | `utter-prefetch-depth`, `utter-max-concurrent-requests` | 2, 2 |
 | `utter-cache-directory` | `$XDG_CACHE_HOME/utter` or `~/.cache/utter` |
@@ -377,7 +396,8 @@ Input/Output gptel-style, and moved the rate to the rate-up label only):
   clears it), `utter-preset-variable` (reads the engine's `utter--preset`;
   struck through when a setting of the preset spec no longer holds; reader
   annotated with `:description`), `utter--scope-variable`,
-  `utter--toggle-variable`.  `-f` completes with `require-match` over
+  `utter--toggle-variable`, `utter--highlight-variable` (`-H` cycles
+  `(off)` → `(sentence)` → `(word)`).  `-f` completes with `require-match` over
   `utter--formats` for the backend and model.  `-i` is `:inapt-if` the
   model lacks `instructions`; `@` is `:inapt-if` no presets exist.  Numeric
   reader copied from `gptel--transient-read-number`.
