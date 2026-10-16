@@ -137,8 +137,9 @@ return the backend):
 (utter-make-say NAME &key voices (formats '(aiff m4a)))   ; process kind; speed 1.0 = 175 wpm; text via -f tmpfile
 (utter-make-openai NAME &key (host "api.openai.com") (protocol "https") (endpoint "/v1/audio/speech")
                    key header curl-args request-params body-transform
-                   (models '(gpt-4o-mini-tts tts-1 tts-1-hd))
-                   (voices '("alloy" "ash" "coral" "echo" "fable" "nova" "onyx" "sage" "shimmer"))
+                   (models '(gpt-4o-mini-tts (tts-1 :voices TTS-1-VOICES)
+                                             (tts-1-hd :voices TTS-1-VOICES)))
+                   (voices '("alloy" ... "shimmer" "ballad" "verse" "marin" "cedar"))
                    (formats '(mp3 wav opus aac flac pcm)) (max-chars 4096)
                    (capabilities '(instructions)) (instructions-key :instructions))
 (utter-make-elevenlabs NAME &key (host "api.elevenlabs.io") key curl-args request-params

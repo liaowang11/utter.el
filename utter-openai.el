@@ -65,6 +65,11 @@
 
 (require 'utter-core)
 
+(defconst utter-openai-tts-1-voices
+  '("alloy" "ash" "coral" "echo" "fable" "nova" "onyx" "sage" "shimmer")
+  "Voices of OpenAI's tts-1 and tts-1-hd models.
+gpt-4o-mini-tts also has ballad, verse, marin and cedar.")
+
 (cl-defstruct (utter-openai (:include utter-backend)
                             (:constructor utter--make-openai)
                             (:copier nil))
@@ -76,8 +81,9 @@ INSTRUCTIONS-KEY is the body key used for instructions."
 (cl-defun utter-make-openai
     (name &key (host "api.openai.com") (protocol "https") (endpoint "/v1/audio/speech")
           (key #'utter-api-key-from-auth-source) header curl-args request-params body-transform
-          (models '(gpt-4o-mini-tts tts-1 tts-1-hd))
-          (voices '("alloy" "ash" "coral" "echo" "fable" "nova" "onyx" "sage" "shimmer"))
+          (models `(gpt-4o-mini-tts (tts-1 :voices ,utter-openai-tts-1-voices)
+                                    (tts-1-hd :voices ,utter-openai-tts-1-voices)))
+          (voices (append utter-openai-tts-1-voices '("ballad" "verse" "marin" "cedar")))
           (formats '(mp3 wav opus aac flac pcm)) (max-chars 4096)
           (capabilities '(instructions)) (instructions-key :instructions))
   "Register and return an OpenAI-compatible speech backend called NAME.

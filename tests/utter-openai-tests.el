@@ -42,6 +42,23 @@
     (should-not (plist-member (plist-get (utter-request "x" :backend b :dry-run t) :body)
                               :instructions))))
 
+(ert-deftest utter-openai-test-voices-per-model ()
+  "gpt-4o-mini-tts offers all 13 voices; tts-1 and tts-1-hd only the older 9."
+  (let* ((utter--known-backends nil)
+         (b (utter-make-openai "OpenAI-voices" :key "k"))
+         (names (lambda (model) (mapcar #'utter--voice-name (utter--static-voices b model)))))
+    (should (equal (mapcar #'utter--model-name (utter-backend-models b))
+                   '(gpt-4o-mini-tts tts-1 tts-1-hd)))
+    (should (equal (car (funcall names 'gpt-4o-mini-tts)) "alloy"))
+    (dolist (v '("ballad" "verse" "marin" "cedar"))
+      (should (member v (funcall names 'gpt-4o-mini-tts)))
+      (should (utter--voice-valid-p b v 'gpt-4o-mini-tts))
+      (dolist (old '(tts-1 tts-1-hd))
+        (should-not (member v (funcall names old)))
+        (should-not (utter--voice-valid-p b v old))))
+    (should (= (length (funcall names 'gpt-4o-mini-tts)) 13))
+    (should (= (length (funcall names 'tts-1)) 9))))
+
 (ert-deftest utter-openai-test-speed-clamped ()
   (let ((b (utter-make-openai "OpenAI-clamp" :key "k")))
     (should (= (plist-get (plist-get (utter-request "x" :backend b :speed 9 :dry-run t) :body) :speed)
