@@ -26,6 +26,17 @@
 ;; own Content-Length and "Connection: close", and closes after one
 ;; response.  A responder that signals produces a 500.
 ;;
+;; A progressive response replaces :body with :parts, a list of byte
+;; strings, and :delay, the seconds to wait between them (default 0.1):
+;;
+;;   (:status 200 :headers (("Content-Type" . "audio/mpeg"))
+;;    :parts (PART1 PART2 PART3) :delay 0.2)
+;;
+;; The head and the first part go out at once, each later part after
+;; :delay, and the connection is closed after the last.  Content-Length
+;; is the sum of the parts unless :headers gives one, which lets a test
+;; promise more bytes than it sends and so cut the body short.
+;;
 ;; The server lives in the same Emacs as the test, so the client must be
 ;; asynchronous (`make-process', `url-retrieve'); a synchronous
 ;; `call-process' curl blocks the event loop and hangs.  Wait with
@@ -230,11 +241,23 @@ Return (METHOD TARGET HEADERS)."
          (let ((body (substring data start (+ start len))))
            (push (list :method method :path target :headers headers :body body)
                  utter-test-server--requests)
-           (process-send-string
-            proc (utter-test-server--response method target headers body))
-           ;; Half-close: curl reads to Content-Length and closes; the
-           ;; sentinel then deletes the connection.
-           (process-send-eof proc)))))))
+           (pcase-let ((`(,head ,parts ,delay)
+                        (utter-test-server--response method target headers body)))
+             (process-send-string proc head)
+             (utter-test-server--send-parts proc parts delay))))))))
+
+(defun utter-test-server--send-parts (proc parts delay)
+  "Send PARTS to PROC, DELAY seconds apart, then half-close it.
+The first part goes out at once.  A connection closed meanwhile ends
+the sending."
+  (when (process-live-p proc)
+    (when parts (process-send-string proc (car parts)))
+    (if (cdr parts)
+        (run-at-time (or delay 0.1) nil #'utter-test-server--send-parts
+                     proc (cdr parts) delay)
+      ;; Half-close: curl reads to Content-Length and closes; the
+      ;; sentinel then deletes the connection.
+      (process-send-eof proc))))
 
 (defun utter-test-server--dispatch (method target headers body)
   "Return the response plist for a request of METHOD to TARGET.
@@ -249,15 +272,25 @@ HEADERS and BODY are passed to function responders."
         (error (list :status 500 :body (error-message-string err)))))
      (t (cdr route)))))
 
+(defun utter-test-server--bytes (string)
+  "Return STRING as unibyte bytes, encoding multibyte text as UTF-8."
+  (if (multibyte-string-p string) (encode-coding-string string 'utf-8) string))
+
 (defun utter-test-server--response (method target headers body)
-  "Return the raw HTTP response bytes for the request.
-METHOD, TARGET, HEADERS and BODY describe the request."
+  "Return (HEAD PARTS DELAY), the raw HTTP response for the request.
+HEAD is the status line and headers, PARTS the list of body byte
+strings and DELAY the responder's :delay.  METHOD, TARGET, HEADERS
+and BODY describe the request."
   (let* ((resp (utter-test-server--dispatch method target headers body))
          (status (or (plist-get resp :status) 200))
-         (payload (or (plist-get resp :body) ""))
-         (payload (if (multibyte-string-p payload)
-                      (encode-coding-string payload 'utf-8)
-                    payload))
+         (parts (mapcar #'utter-test-server--bytes
+                        (if (plist-member resp :parts)
+                            (plist-get resp :parts)
+                          (list (or (plist-get resp :body) "")))))
+         (length (or (and (plist-member resp :parts)
+                          (cdr (assoc "content-length" (plist-get resp :headers)
+                                      #'string-equal-ignore-case)))
+                     (number-to-string (apply #'+ (mapcar #'length parts)))))
          (head (concat
                 (format "HTTP/1.1 %d %s\r\n" status
                         (alist-get status utter-test-server--reasons "Status"))
@@ -268,9 +301,9 @@ METHOD, TARGET, HEADERS and BODY describe the request."
                                       '("content-length" "connection")))
                             (plist-get resp :headers))
                            "")
-                (format "Content-Length: %d\r\nConnection: close\r\n\r\n"
-                        (length payload)))))
-    (concat (encode-coding-string head 'utf-8) payload)))
+                (format "Content-Length: %s\r\nConnection: close\r\n\r\n"
+                        length))))
+    (list (encode-coding-string head 'utf-8) parts (plist-get resp :delay))))
 
 (provide 'utter-test-server)
 ;;; utter-test-server.el ends here
