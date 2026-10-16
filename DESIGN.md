@@ -237,7 +237,9 @@ targets. Existing SSML protection applies.
   tick created
   segments (position 0))             ; PRIVATE slots: access via utter--item-segments / utter--item-position
 
-(cl-defstruct utter--segment index text status file request error duration) ; private
+(cl-defstruct utter--segment index text status file request error duration ; private
+  start end format source-text cues (retries 0) feed)
+  ; status: pending | synthesizing | retry | ready | streaming | playing | done | error
 
 (utter-enqueue TEXT &rest PARAMS)      ; snapshot, preprocess, split, append, start if idle; returns item
 (utter-interrupt TEXT &rest PARAMS)    ; stop player, abort requests, mark current+pending interrupted, play TEXT now
@@ -261,11 +263,14 @@ Player:
 
 ```elisp
 (cl-defstruct utter-player name formats command  ; command: (lambda (file rate) -> argv)
+  stdin-command                                  ; (lambda (rate format &optional offset) -> argv) | nil
   (pause #'utter-player-sigstop) (resume #'utter-player-sigcont) (stop #'delete-process))
-utter-player-afplay   ; afplay -r RATE FILE  (mp3 wav aiff m4a aac flac)
+utter-player-afplay   ; afplay -r RATE FILE  (mp3 wav aiff m4a aac flac); no stdin-command
 utter-player-ffplay   ; ffplay -nodisp -autoexit -loglevel error -af atempo=RATE FILE
-utter-player-mpv      ; mpv --no-video --speed=RATE FILE
+                      ; stdin: ffplay -nodisp -autoexit -infbuf -loglevel error -af [atrim=start=OFFSET,]atempo=RATE -i pipe:0
+utter-player-mpv      ; mpv --no-video --speed=RATE FILE;  stdin: mpv --no-video --speed=RATE -
 (defcustom utter-player 'auto)   ; first installed player that plays the segment's format
+(utter--select-stream-player FORMAT) ; same, among players with a stdin-command; an explicit utter-player without one => nil
 ```
 
 Pause is SIGSTOP/SIGCONT for afplay (verified: it keeps its place). ffplay
@@ -273,10 +278,46 @@ stops under SIGSTOP but skips the paused stretch on SIGCONT, so
 `utter-player-ffplay` resumes by restarting at the paused offset with `-ss`
 (`utter-player-restart`; a player `command` may take an optional third
 argument OFFSET). mpv is not installed here and its SIGCONT path is
-unverified. Prefetch
+unverified. `utter-player-sigcont` uses `continue-process`, which also
+marks the process running; after a bare SIGCONT Emacs still thinks it
+stopped and refuses to write to it. Prefetch
 `utter-prefetch-depth` (2) segments ahead across item boundaries, at most
 `utter-max-concurrent-requests` (2) curl processes. On 429/5xx retry once
 with backoff, then mark the segment `error`, `message` it, continue.
+
+Streaming (`utter-streaming`, nil): `utter--stream-eligible-p (backend
+model format)` holds when the option is on, the backend/model has the
+`streaming` capability, `utter--stream-kind` is non-nil and
+`utter--stream-available-p`, and the format is mp3. `utter--request-segment`
+passes `:stream t :stream-callback` only for the segment about to play
+(current item, at its position, no player running, not paused, not
+`:cache-only`), and only when `utter--select-stream-player` finds a
+player; with afplay alone it messages once per session ("streaming needs
+ffplay or mpv; playing whole audio instead") and requests whole audio.
+With the option off `utter-request` never sees `:stream`. Prefetched
+segments always download whole. The segment's `utter--feed` holds the
+pipe player and every piece received. `(:start)` starts the stdin player
+(binary coding) and the segment becomes `streaming`; the queue is
+`playing`. `(:data)` is written to the player, or held while paused (a
+stopped reader would fill the pipe and block Emacs). `(:alignment)`
+appends the sentence/word cues whose end the timed prefix covers
+(`nconc`, cues are timing-independent) and restarts progress. `(:end)`
+sends EOF. The final callback with audio turns `streaming` into
+`playing`; one with `:stream-started` nil, or for a stream that was not
+played (paused before `:start`, no player), is whole audio as before.
+An error with `:stream-started` t kills the player, drops the partial
+cues and resets the segment to `pending` once (`retries`), so it is
+requested again from its start; the second failure is the usual
+`error`. A player that exits while its segment is `streaming` aborts the
+request and fails the segment. Killing the player (stop, next,
+previous, interrupt) aborts a streaming request and leaves the segment
+`pending`. Pause is SIGSTOP plus holding data back; resume for SIGCONT
+players continues and flushes (then EOF if the stream ended). ffplay
+skips the paused stretch on SIGCONT also on a pipe (spike 2026-10-16),
+so it restarts: from the finished file with `-ss` when the stream has
+ended, else on a new pipe with `atrim=start=OFFSET`, given all bytes so
+far. `-infbuf` is needed: without it ffplay reads about a second ahead
+and the pipe fills.
 
 Hooks (public):
 
@@ -368,6 +409,7 @@ sizes toward the limit, and removes orphan alignment files.
 | `utter-cache-max-size` | 500 MB, pruned by atime at enqueue |
 | `utter-voice-cache-ttl` | 86400 |
 | `utter-player` | `auto` |
+| `utter-streaming` | nil; plays audio while it arrives, for `streaming`-capable backends with ffplay or mpv |
 | `utter-curl-program`, `utter-proxy`, `utter-log-level` | "curl", "", nil |
 | `utter-input-functions` | `(utter--gptel-response-at-point utter--org-subtree-at-point utter--page-at-point)`; each returns (BEG . END) or nil, labelled for the menu by the `utter-input-label` symbol property |
 | `utter-page-modes` | `(eww-mode Info-mode nov-mode help-mode Man-mode woman-mode)`, read whole |
