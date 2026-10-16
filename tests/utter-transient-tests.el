@@ -671,6 +671,20 @@ macro."
     (should (equal (substring-no-properties (transient-format-value obj))
                    "(on)"))))
 
+(ert-deftest utter-transient-test-highlight-cycles-off-sentence-word ()
+  (should (utter--highlight-variable-p
+           (get 'utter--infix-highlight 'transient--suffix)))
+  (let ((obj (utter--highlight-variable :variable 'utter-highlight))
+        (transient--prefix (transient-prefix :command 'utter-menu)))
+    (pcase-dolist (`(,value ,shown ,next) '((nil "(off)" t)
+                                            (t "(sentence)" word)
+                                            (word "(word)" nil)))
+      (oset obj value value)
+      (should (equal (substring-no-properties (transient-format-value obj)) shown))
+      (should (eq (get-text-property 0 'face (transient-format-value obj))
+                  (if value 'transient-value 'transient-inactive-value)))
+      (should (eq (transient-infix-read obj) next)))))
+
 (ert-deftest utter-transient-test-read-number ()
   (cl-letf (((symbol-function 'read-number) (lambda (&rest _) -1)))
     (should (null (utter--transient-read-number "Speed: " nil nil))))

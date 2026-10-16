@@ -486,6 +486,27 @@ and redraw the menu."
       (propertize "(on)" 'face 'transient-value)
     (propertize "(off)" 'face 'transient-inactive-value)))
 
+(defclass utter--highlight-variable (utter-lisp-variable)
+  ()
+  "Infix that cycles `utter-highlight' through off, sentence and word.")
+
+(defconst utter-transient--highlight-names '((nil . "off") (t . "sentence")
+                                             (word . "word"))
+  "Display names of the values of `utter-highlight', in cycling order.")
+
+(cl-defmethod transient-infix-read ((obj utter--highlight-variable))
+  "Return the value after OBJ's current one: off, sentence, word."
+  (let ((tail (cdr (cl-member (oref obj value) utter-transient--highlight-names
+                              :key #'car))))
+    (car (car (or tail utter-transient--highlight-names)))))
+
+(cl-defmethod transient-format-value ((obj utter--highlight-variable))
+  "Show OBJ as (off), (sentence) or (word)."
+  (let ((value (oref obj value)))
+    (propertize (format "(%s)" (or (alist-get value utter-transient--highlight-names)
+                                   value))
+                'face (if value 'transient-value 'transient-inactive-value))))
+
 (defclass utter-preset-variable (utter-lisp-variable)
   ()
   "Infix for `utter--preset' that applies a preset from `utter--known-presets'.")
@@ -581,8 +602,8 @@ and redraw the menu."
   :reader #'utter-transient--read-instructions)
 
 (transient-define-infix utter--infix-highlight ()
-  "Highlight the text being spoken."
-  :class 'utter--toggle-variable
+  "Highlight the text being spoken: off, sentence or word."
+  :class 'utter--highlight-variable
   :description "Highlight spoken text"
   :key "-H"
   :variable 'utter-highlight
