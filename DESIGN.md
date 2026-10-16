@@ -76,7 +76,7 @@ Ownership rules for parallel work:
   name host protocol endpoint url header key
   models voices formats max-chars
   (max-chars-unit 'chars)            ; chars | bytes | utf16
-  (response-kind 'bytes)             ; bytes | b64-json | b64-lines | hex | url | process
+  (response-kind 'bytes)             ; bytes | b64-json | hex | url | process
   response-path                      ; for b64-json: list of keys/indices to the audio string
   capabilities                       ; (instructions ssml timestamps stitching clone)
   request-params curl-args body-transform
@@ -94,16 +94,24 @@ Ownership rules for parallel work:
 (cl-defgeneric utter--parse-error (backend info))                ; -> string or nil; RUNS ON EVERY RESPONSE
 (cl-defgeneric utter--list-voices (backend callback))            ; cached per name, utter-voice-cache-ttl
 (cl-defgeneric utter--start-process (backend text params file callback)) ; response-kind process
+;; Streaming (all have defaults; a backend opts in through utter--stream-kind)
+(cl-defgeneric utter--stream-kind (backend))                     ; -> bytes | b64-lines | websocket | nil (default)
+(cl-defgeneric utter--stream-available-p (backend))              ; default t; nil => whole-audio request
+(cl-defgeneric utter--stream-request-body (backend body params)) ; default identity; after request-params, before body-transform
+(cl-defgeneric utter--stream-alignment-piece (backend info json)) ; -> (:characters STRING-OR-LIST :starts LIST :ends LIST) | nil
+(cl-defgeneric utter--stream-open (backend info params on-event)) ; websocket kind only -> HANDLE; default signals
+(cl-defgeneric utter--stream-close (backend handle))             ; called by utter-abort; default deletes a process
 
 (cl-defun utter-request
     (text &key (backend utter-backend) (model utter-model) (voice utter-voice)
           (speed utter-speed) (format utter-format) language instructions
-          context file callback dry-run (cache t))
+          context file callback dry-run (cache t) stream stream-callback)
   "Synthesize TEXT, which must fit BACKEND's max-chars, asynchronously.
-Return an `utter-request' struct (slots: process info status).
+Return an `utter-request' struct (slots: process info status handle).
 CALLBACK is called (AUDIO INFO): AUDIO is a file name, nil on error
 (INFO :error), or the symbol `abort'.  INFO keys: :backend :model :voice
-:speed :format :text :file :cached :http-status :error :duration :alignment :request.
+:speed :format :text :file :cached :http-status :error :duration :alignment :request,
+plus :stream t and :stream-started on a streamed request.
 Signals `utter-text-too-long' instead of splitting.")
 (utter-abort REQUEST)
 (utter-fetch-json BACKEND METHOD PATH CALLBACK &optional BODY)
@@ -125,11 +133,43 @@ Core behaviour that is not optional:
   `fLaC`, `OggS`, `FORM` ⇒ audio) before returning a file.
 - Raw PCM is wrapped in a 44-byte WAV header in the decoder, with the
   sample rate from the backend/format, so players only ever see containers.
-- `b64-json` extracts by `response-path`; `b64-lines`, `hex`, `url` are
-  documented extension points, not MVP.
+- `b64-json` extracts by `response-path`; `hex`, `url` are documented
+  extension points, not MVP. `b64-lines` exists as a stream kind only.
 - Dry run returns `(:url :headers :body :curl-args)` with header values
-  redacted and starts no process.
+  redacted and starts no process; a streamed one adds `:stream t` and
+  shows the stream body and argv (`:curl-args` nil for `websocket`).
 - Retries are the queue's job, not core's. Core reports `:http-status`.
+- **Streaming** (`:stream t`) applies only when `utter--stream-kind` is
+  non-nil and `utter--stream-available-p`; otherwise, on a cache hit and
+  for `process` backends the request is made whole and INFO has no
+  `:stream`. With `:stream nil` argv, body and dry run are unchanged.
+  STREAM-CALLBACK gets `(:start :format FMT)` once (FMT `mp3`|`wav`|`pcm`),
+  `(:data BYTES)` unibyte, only after `:start`, `(:alignment
+  (:characters PREFIX :starts VECTOR :ends VECTOR))` with a validated
+  prefix of the text that grows each time, and `(:end)` once after the
+  last data, also before an error after `:start`; never after
+  `utter-abort`. Then CALLBACK runs as usual with `:stream t`,
+  `:stream-started` and the full validated `:alignment`, whose sidecar is
+  cached as on the whole path. Errors before `:start` read exactly as
+  without streaming. A short body (< 64 bytes) of raw `pcm` may finish
+  without any events.
+- Streamed curl: `-sS -K - -N -o - -w %{stderr}%{http_code}` (`-N`, or
+  curl buffers stdout to a pipe), stderr read by a pipe process (process
+  property `utter-stderr`). Kind `bytes` holds 64 bytes for
+  `utter--sniff`; kind `b64-lines` parses each line, decodes
+  `audio_base64` (empty or null audio is legal) and asks
+  `utter--stream-alignment-piece`. The body is tee'd to a temp file and
+  the final file appears only at the end, so the cache never holds a
+  partial file.
+- Kind `websocket`: `utter-request` calls `utter--stream-open` with
+  ON-EVENT taking `(:status N)`, `(:start :format FMT)`, `(:data BYTES)`,
+  `(:alignment PIECE)` (one raw piece; core concatenates and validates),
+  `(:end)` = success, `(:error STRING)` = failure; the first `:end` or
+  `:error` finishes, later events are ignored. The returned handle is in
+  the request's `handle` slot until then. Events sent from inside
+  `utter--stream-open` (a refused handshake) are deferred to a timer, and
+  an open that signals is reported as an error from a timer, so CALLBACK
+  never runs inside `utter-request`.
 
 Constructors (all `;;;###autoload`, `(declare (indent 1))`, register and
 return the backend):

@@ -13,6 +13,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'utter-core)
+(require 'utter-test-server)
 
 ;;;; Helpers
 
@@ -724,6 +725,397 @@ PATH is matched without the query string.")
   (should (cl-every #'utter--finite-number-p '(0 1 1.5 -0.0)))
   (should-not (cl-some #'utter--finite-number-p
                        (list 1.0e+INF -1.0e+INF 0.0e+NaN "1" nil))))
+
+;;;; Streaming
+
+(ert-deftest utter-core-test-normalize-alignment-prefix ()
+  (should (equal (utter--normalize-alignment-prefix "Hi there" ["H" "i"] '(0 0.5) '(0.5 1.0))
+                 '(:characters "Hi" :starts [0 0.5] :ends [0.5 1.0])))
+  (should (equal (utter--normalize-alignment-prefix "Hi" "Hi" [0 1] [1 2])
+                 '(:characters "Hi" :starts [0 1] :ends [1 2])))
+  ;; Not a prefix, too long, or bad times: nil.
+  (should-not (utter--normalize-alignment-prefix "Hi there" ["i"] [0] [1]))
+  (should-not (utter--normalize-alignment-prefix "Hi" "Hi!" [0 1 2] [1 2 3]))
+  (should-not (utter--normalize-alignment-prefix "Hi" "H" [1.0e+INF] [1.0e+INF]))
+  (should-not (utter--normalize-alignment-prefix "Hi" ["H" "i"] [1 0] [1 2]))
+  (should-not (utter--normalize-alignment-prefix "Hi" "" [] [])))
+
+(cl-defstruct (utter-test-stream-backend (:include utter-test-backend)
+                                         (:constructor utter-test--make-stream-backend)
+                                         (:copier nil))
+  "A test backend that streams.  OPEN is the websocket transport stub."
+  (stream-kind 'bytes) open (available t))
+
+(defvar utter-test--closed-handles nil "Handles passed to `utter--stream-close'.")
+
+(cl-defmethod utter--stream-kind ((b utter-test-stream-backend))
+  "Return B's configured stream kind."
+  (utter-test-stream-backend-stream-kind b))
+
+(cl-defmethod utter--stream-available-p ((b utter-test-stream-backend))
+  "Return B's configured availability."
+  (utter-test-stream-backend-available b))
+
+(cl-defmethod utter--stream-request-body ((_b utter-test-stream-backend) body _params)
+  "Ask for a streamed BODY."
+  (plist-put body :stream t))
+
+(cl-defmethod utter--stream-alignment-piece ((_b utter-test-stream-backend) _info json)
+  "Return the ElevenLabs-shaped alignment piece of JSON, or nil."
+  (when-let* ((a (alist-get 'alignment json)))
+    (list :characters (alist-get 'characters a)
+          :starts (alist-get 'character_start_times_seconds a)
+          :ends (alist-get 'character_end_times_seconds a))))
+
+(cl-defmethod utter--stream-open ((b utter-test-stream-backend) info params on-event)
+  "Run B's OPEN stub with INFO, PARAMS and ON-EVENT."
+  (funcall (utter-test-stream-backend-open b) info params on-event))
+
+(cl-defmethod utter--stream-close ((_b utter-test-stream-backend) handle)
+  "Record HANDLE as closed."
+  (push handle utter-test--closed-handles))
+
+(defun utter-test-stream-backend (port &rest slots)
+  "Return a streaming test backend for the stub on PORT with extra SLOTS."
+  (apply #'utter-test--make-stream-backend
+         (append slots
+                 (list :name "Stream" :host (format "127.0.0.1:%d" port)
+                       :protocol "http" :endpoint "/ok"
+                       :models '(m1) :voices '("v1") :formats '(mp3 pcm)
+                       :max-chars 100 :header #'utter-bearer-header
+                       :key "sk-secret"))))
+
+(defun utter-test-stream (text &rest keys)
+  "Stream TEXT with KEYS and wait.
+Return (AUDIO INFO EVENTS) with EVENTS oldest first."
+  (let (result events)
+    (apply #'utter-request text :stream t
+           :stream-callback (lambda (e) (push e events))
+           :callback (lambda (audio info) (setq result (list audio info)))
+           keys)
+    (utter-test-server-wait-for (lambda () result))
+    (append result (list (reverse events)))))
+
+(defun utter-test-mp3-frames (n)
+  "Return N silent MP3 frames as a list of unibyte strings."
+  (make-list n (utter-test-server-mp3-bytes)))
+
+(ert-deftest utter-core-test-nonstream-argv-and-dry-run-unchanged ()
+  (let* ((b (utter-test-backend "api.example.test" :protocol "https"))
+         (expected `(:url "https://api.example.test/ok"
+                     :headers (("Content-Type" . "application/json")
+                               ("Authorization" . "[redacted]"))
+                     :body (:input "hi" :voice "v1" :response_format "mp3")
+                     :curl-args ("curl" "-sS" "-K" "-" "-o" "RAWFILE" "-w" "%{http_code}"))))
+    (should (equal (utter-request "hi" :backend b :dry-run t) expected))
+    (should (equal (utter-request "hi" :backend b :dry-run t :stream nil) expected))
+    ;; A backend that cannot stream ignores :stream.
+    (should (equal (utter-request "hi" :backend b :dry-run t :stream t) expected))
+    (let ((sb (utter-test--make-stream-backend
+               :name "S" :host "api.example.test" :protocol "https" :endpoint "/ok"
+               :models '(m1) :voices '("v1") :formats '(mp3) :header #'utter-bearer-header
+               :key "sk-secret")))
+      (should (equal (utter-request "hi" :backend sb :dry-run t) expected))
+      (setf (utter-test-stream-backend-available sb) nil)
+      (should (equal (utter-request "hi" :backend sb :dry-run t :stream t) expected))
+      (setf (utter-test-stream-backend-available sb) t)
+      (let ((d (utter-request "hi" :backend sb :dry-run t :stream t)))
+        (should (eq (plist-get d :stream) t))
+        (should (eq (plist-get (plist-get d :body) :stream) t))
+        (should (equal (plist-get d :curl-args)
+                       '("curl" "-sS" "-K" "-" "-N" "-o" "-" "-w" "%{stderr}%{http_code}"))))))
+  ;; A live non-stream request runs exactly the old argv.
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-server `(("/ok" 200 "audio/mpeg" ,utter-test-mp3))
+    (let* ((res nil)
+           (req (utter-request "hi" :backend (utter-test-backend host) :cache nil :stream nil
+                               :callback (lambda (a i) (setq res (list a i)))))
+           (argv (process-command (utter-request-process req))))
+      (should (equal (butlast argv 3) '("curl" "-sS" "-K" "-" "-o")))
+      (should (equal (last argv 2) '("-w" "%{http_code}")))
+      (should (utter-test-wait (lambda () res)))
+      (should-not (plist-member (cadr res) :stream))
+      (should-not (plist-member (cadr res) :stream-started))
+      (delete-file (car res)))))
+
+(ert-deftest utter-core-test-request-stream-first-bytes-before-end ()
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-temp-dir dir
+    (let* ((frames (utter-test-mp3-frames 3))
+           (body (apply #'concat frames)))
+      (utter-test-server-with
+          (port `(("^/ok$" . (:headers (("Content-Type" . "audio/mpeg"))
+                              :parts ,frames :delay 0.3))))
+        (let* ((utter-cache-directory dir)
+               (b (utter-test-stream-backend port))
+               (events nil) (res nil) (at-first-data nil) (req nil))
+          (setq req (utter-request
+                     "hello" :backend b :stream t
+                     :stream-callback
+                     (lambda (e)
+                       (when (and (eq (car e) :data) (not at-first-data))
+                         (setq at-first-data
+                               (list (utter-request-status req) res (length (cadr e)))))
+                       (push e events))
+                     :callback (lambda (a i) (setq res (list a i)))))
+          (should (equal (process-command (utter-request-process req))
+                         '("curl" "-sS" "-K" "-" "-N" "-o" "-" "-w" "%{stderr}%{http_code}")))
+          (should (utter-test-server-wait-for (lambda () res)))
+          (setq events (reverse events))
+          ;; The first audio arrived while the request was still running.
+          (should (eq (nth 0 at-first-data) 'running))
+          (should-not (nth 1 at-first-data))
+          (should (< (nth 2 at-first-data) (length body)))
+          (should (equal (car events) '(:start :format mp3)))
+          (should (equal (car (last events)) '(:end)))
+          (should (> (length events) 3))
+          (should (equal (mapconcat #'cadr (cl-remove-if-not
+                                            (lambda (e) (eq (car e) :data)) events)
+                                    "")
+                         body))
+          (pcase-let ((`(,audio ,info) res))
+            (should (equal audio (utter-cache-file
+                                  (utter-cache-key b (list :model 'm1 :voice "v1" :speed 1.0
+                                                           :format 'mp3)
+                                                   "hello")
+                                  'mp3)))
+            (should (equal (utter-test-file-bytes audio) body))
+            (should (eq (plist-get info :stream) t))
+            (should (eq (plist-get info :stream-started) t))
+            (should (eq (plist-get info :format) 'mp3))
+            (should (= (plist-get info :http-status) 200))
+            (should (eq (utter-request-status req) 'done))
+            (dolist (f (plist-get info :temp-files)) (should-not (file-exists-p f))))
+          (should (eq (plist-get (json-parse-string
+                                  (plist-get (car (utter-test-server-requests)) :body)
+                                  :object-type 'plist)
+                                 :stream)
+                      t)))))))
+
+(ert-deftest utter-core-test-stream-json-body-is-error ()
+  (skip-unless (executable-find "curl"))
+  (let ((json "{\"error\":{\"message\":\"quota exceeded\"}}"))
+    (utter-test-server-with
+        (port `(("^/ok$" . (:headers (("Content-Type" . "application/octet-stream"))
+                            :parts (,(substring json 0 10) ,(substring json 10))
+                            :delay 0.05))))
+      (let* ((b (utter-test-stream-backend port))
+             (res (utter-test-stream "hi" :backend b :cache nil))
+             (plain (utter-test-request "hi" :backend b :cache nil)))
+        (should-not (car res))
+        (should (equal (plist-get (cadr res) :error) (plist-get (cadr plain) :error)))
+        (should (equal (plist-get (cadr res) :error)
+                       "HTTP 200 with a JSON body: quota exceeded"))
+        (should (= (plist-get (cadr res) :http-status) 200))
+        (should (eq (plist-get (cadr res) :stream) t))
+        (should-not (plist-get (cadr res) :stream-started))
+        (should-not (nth 2 res))
+        (dolist (f (plist-get (cadr res) :temp-files)) (should-not (file-exists-p f)))))))
+
+(ert-deftest utter-core-test-stream-401-status-from-stderr ()
+  (skip-unless (executable-find "curl"))
+  (utter-test-server-with
+      (port '(("^/ok$" . (:status 401 :headers (("Content-Type" . "application/json"))
+                          :parts ("{\"error\":{\"message\":\"Incorrect API key provided\"}}")))))
+    (let ((res (utter-test-stream "hi" :backend (utter-test-stream-backend port) :cache nil)))
+      (should-not (car res))
+      (should (equal (plist-get (cadr res) :error) "HTTP 401: Incorrect API key provided"))
+      (should (= (plist-get (cadr res) :http-status) 401))
+      (should-not (plist-get (cadr res) :stream-started))
+      (should-not (nth 2 res)))))
+
+(ert-deftest utter-core-test-stream-partial-after-start-reports-stream-started-and-deletes-partial ()
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-temp-dir dir
+    (utter-test-server-with
+        (port `(("^/ok$" . (:headers (("Content-Type" . "audio/mpeg")
+                                      ("Content-Length" . "5000"))
+                            :parts ,(utter-test-mp3-frames 2) :delay 0.1))))
+      (let* ((utter-cache-directory dir)
+             (res (utter-test-stream "partial" :backend (utter-test-stream-backend port)))
+             (info (cadr res))
+             (events (nth 2 res)))
+        (should-not (car res))
+        (should (string-match-p "\\`curl exited 18" (plist-get info :error)))
+        (should (eq (plist-get info :stream-started) t))
+        (should (equal (car events) '(:start :format mp3)))
+        (should (equal (car (last events)) '(:end)))
+        (should (= 1 (cl-count '(:end) events :test #'equal)))
+        (should-not (file-exists-p (plist-get info :partial-file)))
+        (dolist (f (plist-get info :temp-files)) (should-not (file-exists-p f)))
+        (should-not (directory-files dir nil "\\`[^.]"))))))
+
+(ert-deftest utter-core-test-stream-abort ()
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-temp-dir dir
+    (utter-test-server-with
+        (port `(("^/ok$" . (:headers (("Content-Type" . "audio/mpeg"))
+                            :parts ,(utter-test-mp3-frames 4) :delay 2))))
+      (let* ((utter-cache-directory dir)
+             (calls nil) (events nil)
+             (req (utter-request "abort me" :backend (utter-test-stream-backend port)
+                                 :stream t
+                                 :stream-callback (lambda (e) (push (car e) events))
+                                 :callback (lambda (a _i) (push a calls))))
+             (proc (utter-request-process req))
+             (stderr (process-get proc 'utter-stderr)))
+        (should (processp stderr))
+        (should (utter-test-server-wait-for (lambda () (memq :data events))))
+        (utter-abort req)
+        (should (equal calls '(abort)))
+        (should (eq (utter-request-status req) 'aborted))
+        (accept-process-output nil 0.2)
+        (should-not (process-live-p proc))
+        (should-not (process-live-p stderr))
+        (should (equal calls '(abort)))
+        (should-not (memq :end events))
+        (dolist (f (plist-get (utter-request-info req) :temp-files))
+          (should-not (file-exists-p f)))
+        (should-not (directory-files dir nil "\\`[^.]"))))))
+
+(defun utter-test-elevenlabs-line (audio characters starts ends)
+  "Return one ElevenLabs NDJSON line for AUDIO bytes and an alignment.
+CHARACTERS, STARTS and ENDS describe it; CHARACTERS nil gives a
+null alignment."
+  (concat
+   (json-serialize
+    `(:audio_base64 ,(base64-encode-string audio t)
+      :alignment ,(if characters
+                      `(:characters ,(vconcat (mapcar #'char-to-string characters))
+                        :character_start_times_seconds ,(vconcat starts)
+                        :character_end_times_seconds ,(vconcat ends))
+                    :null)
+      :normalized_alignment :null))
+   "\n"))
+
+(ert-deftest utter-core-test-stream-b64-lines-alignment-prefix-events ()
+  (skip-unless (executable-find "curl"))
+  (utter-test-with-temp-dir dir
+    (let* ((text "The first sentence is here")
+           (one "The first sentence ")
+           (two "is here")
+           (times (lambda (from n) (cl-loop for i below n collect (+ from (* 0.05 i)))))
+           (mp3 (utter-test-server-mp3-bytes))
+           (a (substring mp3 0 200))
+           (b (substring mp3 200))
+           (s1 (funcall times 0.0 (length one)))
+           (e1 (mapcar (lambda (x) (+ x 0.05)) s1))
+           ;; Absolute times: the second piece continues where the first ended.
+           (s2 (funcall times (car (last e1)) (length two)))
+           (e2 (mapcar (lambda (x) (+ x 0.05)) s2))
+           (ndjson (concat (utter-test-elevenlabs-line a nil nil nil)
+                           (utter-test-elevenlabs-line b one s1 e1)
+                           (utter-test-elevenlabs-line "" two s2 e2)))
+           ;; Split mid-line, so lines straddle process-filter calls.
+           (parts (list (substring ndjson 0 37) (substring ndjson 37 400)
+                        (substring ndjson 400))))
+      (utter-test-server-with
+          (port `(("^/ok$" . (:headers (("Content-Type" . "application/json"))
+                              :parts ,parts :delay 0.1))))
+        (let* ((utter-cache-directory dir)
+               (backend (utter-test-stream-backend port :stream-kind 'b64-lines))
+               (res (utter-test-stream text :backend backend))
+               (info (cadr res))
+               (events (nth 2 res))
+               (prefix (lambda (chars starts ends)
+                         `(:alignment (:characters ,chars :starts ,(vconcat starts)
+                                       :ends ,(vconcat ends))))))
+          (should (car res))
+          (should (equal events
+                         (list '(:start :format mp3)
+                               (list :data a)
+                               (list :data b)
+                               (funcall prefix one s1 e1)
+                               (funcall prefix text (append s1 s2) (append e1 e2))
+                               '(:end))))
+          (should (equal (utter-test-file-bytes (car res)) mp3))
+          (should (eq (plist-get info :stream-started) t))
+          (should (equal (plist-get info :alignment)
+                         (list :characters text :starts (vconcat s1 s2)
+                               :ends (vconcat e1 e2))))
+          ;; The sidecar is stored as on the unary path.
+          (should (equal (utter--cache-alignment-lookup
+                          (file-name-base (car res)) text)
+                         (plist-get info :alignment))))))))
+
+(ert-deftest utter-core-test-stream-websocket-dispatch ()
+  (let* ((utter-test--closed-handles nil)
+         (mp3 (utter-test-server-mp3-bytes))
+         (script nil)
+         (seen-info nil)
+         (b (utter-test--make-stream-backend
+             :name "WS" :host "ws.example.test" :models '(m1) :voices '("v1")
+             :formats '(mp3) :stream-kind 'websocket
+             :open (lambda (info _params on-event)
+                     (setq seen-info info)
+                     (let ((events script))
+                       (run-at-time 0 nil (lambda () (mapc on-event events))))
+                     'handle-1))))
+    (utter-test-with-temp-dir dir
+      (let ((utter-cache-directory dir))
+        ;; Success: events are passed on, the file and sidecar appear.
+        (setq script `((:status 200) (:start :format mp3) (:data ,(substring mp3 0 100))
+                       (:alignment (:characters ("H" "i") :starts (0.0 0.1) :ends (0.1 0.2)))
+                       (:data ,(substring mp3 100)) (:end)))
+        (let* ((res (utter-test-stream "Hi" :backend b))
+               (info (cadr res)))
+          (should (eq (plist-get seen-info :stream) t))
+          (should (equal (utter-test-file-bytes (car res)) mp3))
+          (should (= (plist-get info :http-status) 200))
+          (should (eq (plist-get info :stream-started) t))
+          (should (equal (plist-get info :alignment)
+                         '(:characters "Hi" :starts [0.0 0.1] :ends [0.1 0.2])))
+          (should (equal (mapcar #'car (nth 2 res))
+                         '(:start :data :alignment :data :end)))
+          (should (utter--cache-alignment-lookup (file-name-base (car res)) "Hi")))
+        ;; An error after audio: (:end) once, then the error with :stream-started.
+        (setq script `((:start :format mp3) (:data ,mp3) (:error "server went away")
+                       (:end) (:data "late")))
+        (let* ((res (utter-test-stream "Bye" :backend b))
+               (info (cadr res)))
+          (should-not (car res))
+          (should (equal (plist-get info :error) "server went away"))
+          (should (eq (plist-get info :stream-started) t))
+          (should (equal (mapcar #'car (nth 2 res)) '(:start :data :end)))
+          (should (plist-get info :partial-file))
+          (should-not (file-exists-p (plist-get info :partial-file)))
+          (dolist (f (plist-get info :temp-files)) (should-not (file-exists-p f))))
+        ;; A status error before audio.
+        (setq script '((:status 403) (:error "HTTP 403")))
+        (let ((res (utter-test-stream "No" :backend b :cache nil)))
+          (should (equal (plist-get (cadr res) :error) "HTTP 403"))
+          (should (= (plist-get (cadr res) :http-status) 403))
+          (should-not (plist-get (cadr res) :stream-started))
+          (should-not (nth 2 res)))
+        ;; Abort closes the handle.
+        (setq script nil)
+        (let* ((calls nil)
+               (req (utter-request "Stop" :backend b :stream t :cache nil
+                                   :callback (lambda (a _i) (push a calls)))))
+          (should (eq (utter-request-handle req) 'handle-1))
+          (utter-abort req)
+          (should (equal calls '(abort)))
+          (should (equal utter-test--closed-handles '(handle-1))))
+        ;; Events sent from inside `utter--stream-open', as websocket.el
+        ;; does on a refused handshake, still reach CALLBACK only later.
+        (setf (utter-test-stream-backend-open b)
+              (lambda (_info _params on-event)
+                (funcall on-event '(:status 403))
+                (funcall on-event '(:error "HTTP 403"))
+                'handle-2))
+        (let* ((res nil)
+               (req (utter-request "Sync" :backend b :stream t :cache nil
+                                   :callback (lambda (a i) (setq res (list a i))))))
+          (should-not res)
+          (should (utter-test-server-wait-for (lambda () res)))
+          (should (equal (plist-get (cadr res) :error) "HTTP 403"))
+          (should (= (plist-get (cadr res) :http-status) 403))
+          (should-not (utter-request-handle req)))
+        ;; A transport that fails to open reports an error asynchronously.
+        (setf (utter-test-stream-backend-open b)
+              (lambda (&rest _) (error "Cannot connect")))
+        (let ((res (utter-test-stream "Err" :backend b :cache nil)))
+          (should (equal (plist-get (cadr res) :error) "Cannot connect")))))))
 
 (provide 'utter-core-tests)
 ;;; utter-core-tests.el ends here

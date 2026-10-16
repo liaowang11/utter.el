@@ -28,6 +28,10 @@
 ;; `bytes' decoder sniffs the first bytes of the body before handing a
 ;; file to a player.  Raw PCM is wrapped in a WAV header.
 ;;
+;; With `:stream', a backend that has an `utter--stream-kind' passes
+;; audio on as it arrives, through curl or a transport of its own
+;; (`utter--stream-open'), and still caches the whole file.
+;;
 ;; Splitting long text, queueing and playback live in other files.
 
 ;;; Code:
@@ -504,6 +508,27 @@ The config goes to curl on stdin, so secrets stay out of argv."
   (append (list utter-curl-program "-sS" "-K" "-" "-o" raw-file "-w" "%{http_code}")
           (utter--maybe-funcall (utter-backend-curl-args backend))))
 
+(defun utter--curl-stream-args (backend)
+  "Return the curl argv for a streamed request on BACKEND.
+The body goes to stdout unbuffered (-N) and the status to stderr."
+  (append (list utter-curl-program "-sS" "-K" "-" "-N" "-o" "-"
+                "-w" "%{stderr}%{http_code}")
+          (utter--maybe-funcall (utter-backend-curl-args backend))))
+
+(defun utter--curl-outcome (out proc)
+  "Return (STATUS ERROR) for the finished curl PROC.
+OUT is the text curl wrote around its trailing `-w' status code.
+STATUS is the HTTP status as an integer or nil; ERROR is a string
+when curl itself failed."
+  (let* ((code (and (string-match "\\([0-9]\\{3\\}\\)\\'" out)
+                    (string-to-number (match-string 1 out))))
+         (exit (process-exit-status proc))
+         (err (unless (and (eq (process-status proc) 'exit) (= exit 0))
+                (let ((msg (string-trim (if code (substring out 0 -3) out))))
+                  (format "curl exited %s%s" exit
+                          (if (string-empty-p msg) "" (concat ": " msg)))))))
+    (list (and code (/= code 0) code) err)))
+
 (defun utter--curl-run (backend url headers data-file method raw-file done)
   "Run curl for BACKEND and call DONE with (STATUS ERROR) when it exits.
 URL, HEADERS, DATA-FILE and METHOD are as in `utter--curl-config'.
@@ -519,19 +544,11 @@ Return the process."
                 :sentinel
                 (lambda (p _event)
                   (unless (process-live-p p)
-                    (let* ((out (with-current-buffer buf (buffer-string)))
-                           (code (and (string-match "\\([0-9]\\{3\\}\\)\\'" out)
-                                      (string-to-number (match-string 1 out))))
-                           (exit (process-exit-status p))
-                           (err (unless (and (eq (process-status p) 'exit) (= exit 0))
-                                  (let ((msg (string-trim
-                                              (if code (substring out 0 -3) out))))
-                                    (format "curl exited %s%s" exit
-                                            (if (string-empty-p msg) ""
-                                              (concat ": " msg)))))))
+                    (let ((outcome (utter--curl-outcome
+                                    (with-current-buffer buf (buffer-string)) p)))
                       (kill-buffer buf)
                       (unless (process-get p 'utter-aborted)
-                        (funcall done (and code (/= code 0) code) err))))))))
+                        (apply done outcome))))))))
     (process-send-string proc (utter--curl-config url headers data-file method))
     (process-send-eof proc)
     proc))
@@ -850,6 +867,18 @@ than its end."
                   :starts start-vector
                   :ends end-vector)))))))
 
+(defun utter--normalize-alignment-prefix (text characters starts ends)
+  "Return normalized alignment for a prefix of TEXT, or nil.
+CHARACTERS, STARTS and ENDS are as in `utter--normalize-alignment'
+but may cover only the first N characters of TEXT, as alignment that
+is still arriving does.  The result has :characters (substring TEXT
+0 N); nil when CHARACTERS are not a nonempty prefix of TEXT or a
+time is invalid."
+  (let ((n (if (stringp characters) (length characters)
+             (length (utter--alignment-array-list characters)))))
+    (when (and (stringp text) (<= n (length text)))
+      (utter--normalize-alignment (substring text 0 n) characters starts ends))))
+
 (defun utter--decode-b64-json (backend info callback)
   "Decode base64 audio at BACKEND's `response-path' in INFO's body.
 Call CALLBACK with the written file, its format and optional response metadata."
@@ -1022,8 +1051,10 @@ MAX-SIZE defaults to `utter-cache-max-size'; nil means no limit."
 
 (cl-defstruct (utter-request (:constructor utter--make-request) (:copier nil))
   "A running or finished `utter-request' call.
-STATUS is one of pending, running, done, error and aborted."
-  process info (status 'pending) timer callback)
+STATUS is one of pending, running, done, error and aborted.  HANDLE
+is a streaming transport that is not a process, such as a
+websocket; `utter-abort' closes it with `utter--stream-close'."
+  process info (status 'pending) timer callback handle)
 
 (defun utter--resolve-params (backend params)
   "Fill nil entries of PARAMS with BACKEND's defaults and normalize them."
@@ -1054,12 +1085,15 @@ STATUS is one of pending, running, done, error and aborted."
       (while pl
         (setq res (plist-put res (pop pl) (pop pl)))))))
 
-(defun utter--request-body (backend text params)
+(defun utter--request-body (backend text params &optional stream)
   "Return the final JSON body plist for TEXT on BACKEND with PARAMS.
-Runs `utter--request-data', merges `request-params' and applies
+Runs `utter--request-data', merges `request-params', applies
+`utter--stream-request-body' when STREAM is non-nil and then
 `body-transform'."
   (let ((body (utter--merge-plists (copy-tree (utter--request-data backend text params))
                                    (copy-tree (utter-backend-request-params backend)))))
+    (when stream
+      (setq body (utter--stream-request-body backend body params)))
     (if-let* ((tf (utter-backend-body-transform backend)))
         (funcall tf body)
       body)))
@@ -1095,7 +1129,8 @@ Runs `utter--request-data', merges `request-params' and applies
           (voice (bound-and-true-p utter-voice))
           (speed (bound-and-true-p utter-speed))
           (format (bound-and-true-p utter-format))
-          language instructions context file callback dry-run (cache t))
+          language instructions context file callback dry-run (cache t)
+          stream stream-callback)
   "Synthesize TEXT, which must fit BACKEND's max-chars, asynchronously.
 Return an `utter-request' struct (slots: process info status).
 BACKEND is a backend or its name; MODEL, VOICE, SPEED and FORMAT
@@ -1111,6 +1146,15 @@ CALLBACK is called (AUDIO INFO): AUDIO is a file name, nil on error
 VECTOR :ends VECTOR), indexed by input characters in audio seconds.
 With DRY-RUN, return a plist (:url :headers :body :curl-args), with
 header values redacted, and start nothing.
+With STREAM non-nil and a backend whose `utter--stream-kind' is
+non-nil and `utter--stream-available-p', the audio is passed on as
+it arrives: STREAM-CALLBACK is called with (:start :format FORMAT)
+once, (:data BYTES) for each piece of audio, (:alignment ALIGNMENT)
+whenever more of TEXT is aligned (ALIGNMENT covers a growing prefix
+of TEXT) and (:end) once after the last data, before CALLBACK.  INFO
+then has :stream t and :stream-started, non-nil once :start was
+sent.  A cache hit, or a backend that cannot stream, ignores STREAM.
+A dry run of a stream adds :stream t.
 Signals `utter-text-too-long' instead of splitting."
   (let* ((backend (utter--resolve-backend backend))
          (max (utter-backend-max-chars backend))
@@ -1126,18 +1170,32 @@ Signals `utter-text-too-long' instead of splitting."
            (key (and cache (utter-cache-key backend params text)))
            (info (append (list :backend backend :text text :cached nil :alignment nil) params))
            (req (utter--make-request :info info :callback callback))
-           (process-kind (eq (utter-backend-response-kind backend) 'process)))
+           (process-kind (eq (utter-backend-response-kind backend) 'process))
+           (stream-kind (and stream (not process-kind)
+                             (utter--stream-kind backend)
+                             (utter--stream-available-p backend)
+                             (utter--stream-kind backend))))
       (setq info (plist-put info :request req))
       (cond
        (dry-run
-        (if process-kind
-            (list :url nil :headers nil :body nil :curl-args nil
-                  :command (utter--process-command backend text params))
+        (cond
+         (process-kind
+          (list :url nil :headers nil :body nil :curl-args nil
+                :command (utter--process-command backend text params)))
+         (stream-kind
+          (setq info (plist-put info :stream t))
+          (list :url (utter--backend-url backend info)
+                :headers (utter--redact-headers (utter--backend-headers backend info))
+                :body (utter--request-body backend text params t)
+                :curl-args (and (not (eq stream-kind 'websocket))
+                                (utter--curl-stream-args backend))
+                :stream t))
+         (t
           (let ((raw "RAWFILE"))
             (list :url (utter--backend-url backend info)
                   :headers (utter--redact-headers (utter--backend-headers backend info))
                   :body (utter--request-body backend text params)
-                  :curl-args (utter--curl-args backend raw)))))
+                  :curl-args (utter--curl-args backend raw))))))
        ((and key (utter-cache-lookup key fmt))
         (let* ((hit (utter-cache-lookup key fmt))
                (alignment (utter--cache-alignment-lookup key text)))
@@ -1182,15 +1240,21 @@ Signals `utter-text-too-long' instead of splitting."
                     (utter--finish req audio-file)))))
           (setq info (plist-put info :file out))
           (unless file (setq info (plist-put info :partial-file out)))
+          (when stream-kind
+            (setq info (plist-put (plist-put info :stream t) :stream-started nil)))
           (setf (utter-request-info req) info)
           (let ((utter-request-info info))
             (run-hooks 'utter-pre-request-hook))
           (setf (utter-request-status req) 'running)
           (make-directory (file-name-directory (expand-file-name out)) t)
-          (if process-kind
-              (setf (utter-request-process req)
-                    (utter--start-process backend text params out on-audio))
-            (utter--start-curl req backend text params out on-audio))
+          (cond
+           (process-kind
+            (setf (utter-request-process req)
+                  (utter--start-process backend text params out on-audio)))
+           (stream-kind
+            (utter--start-stream req backend stream-kind text params out
+                                 on-audio stream-callback))
+           (t (utter--start-curl req backend text params out on-audio)))
           req))))))
 
 (defun utter--process-command (backend text params)
@@ -1225,34 +1289,436 @@ OUT is the destination file; ON-AUDIO receives (FILE FORMAT [METADATA]) or
           (utter--curl-run
            backend url headers data nil raw
            (lambda (status err)
-             (let ((info (plist-put (utter-request-info req) :http-status status)))
-               (setf (utter-request-info req) info)
-               (if err
-                   (utter--finish req nil err)
-                 (let* ((rinfo (list :raw-file raw :http-status status
-                                     :format (plist-get params :format)
-                                     :file out :text text
-                                     :model (plist-get params :model)
-                                     :sample-rate (plist-get params :sample-rate)))
-                        (perr (or (utter--parse-error backend rinfo)
-                                  (unless (and status (<= 200 status 299))
-                                    (format "HTTP %s" status)))))
-                   (if perr
-                       (utter--finish req nil perr)
-                     (condition-case e
-                         (utter--response-audio backend rinfo on-audio)
-                       (error (utter--finish req nil (error-message-string e)))))))))))))
+             (utter--curl-response req backend text params out raw status err
+                                   #'utter--response-audio on-audio))))))
+
+(defun utter--curl-response (req backend text params out raw status err decode on-audio)
+  "Check the finished curl response of REQ and decode it.
+TEXT, PARAMS and OUT are the request's; RAW holds the body, STATUS
+is the HTTP status and ERR curl's own error, as from `utter--curl-run'.
+A curl error, a non-2xx status or an `utter--parse-error' finishes REQ
+with an error; otherwise DECODE is called like `utter--response-audio'
+with BACKEND, the response info and ON-AUDIO."
+  (let ((info (plist-put (utter-request-info req) :http-status status)))
+    (setf (utter-request-info req) info)
+    (if err
+        (utter--finish req nil err)
+      (let* ((rinfo (list :raw-file raw :http-status status
+                          :format (plist-get params :format)
+                          :file out :text text
+                          :model (plist-get params :model)
+                          :sample-rate (plist-get params :sample-rate)))
+             (perr (or (utter--parse-error backend rinfo)
+                       (unless (and status (<= 200 status 299))
+                         (format "HTTP %s" status)))))
+        (if perr
+            (utter--finish req nil perr)
+          (condition-case e
+              (funcall decode backend rinfo on-audio)
+            (error (utter--finish req nil (error-message-string e)))))))))
 
 (defun utter-abort (request)
   "Abort REQUEST, an `utter-request' struct.
-Its process is killed and its callback called with `abort'."
+Its process, the process reading curl's stderr and any streaming
+handle are closed, and its callback is called with `abort'."
   (when (utter-request-p request)
     (when-let* ((timer (utter-request-timer request)))
       (cancel-timer timer))
     (when-let* ((proc (utter-request-process request)))
       (process-put proc 'utter-aborted t)
-      (when (process-live-p proc) (delete-process proc)))
+      (when (process-live-p proc) (delete-process proc))
+      (when-let* ((stderr (process-get proc 'utter-stderr)))
+        (when (process-live-p stderr) (delete-process stderr))))
+    (when-let* ((handle (utter-request-handle request)))
+      (setf (utter-request-handle request) nil)
+      (ignore-errors
+        (utter--stream-close (plist-get (utter-request-info request) :backend) handle)))
     (utter--finish request 'abort)))
+
+;;;; Streaming
+
+(cl-defgeneric utter--stream-kind (backend)
+  "Return how BACKEND streams audio: `bytes', `b64-lines', `websocket' or nil.
+`bytes' is a body of audio bytes, `b64-lines' newline-delimited JSON
+objects with base64 audio in `audio_base64', and `websocket' a
+transport opened by `utter--stream-open'.  nil means BACKEND does
+not stream.")
+
+(cl-defmethod utter--stream-kind ((_backend utter-backend))
+  "Return nil: backends do not stream unless they say so."
+  nil)
+
+(cl-defgeneric utter--stream-available-p (backend)
+  "Return non-nil if BACKEND can stream right now.
+A backend whose transport needs an optional package returns nil
+when it is missing, and the request is made whole instead.")
+
+(cl-defmethod utter--stream-available-p ((_backend utter-backend))
+  "Return t."
+  t)
+
+(cl-defgeneric utter--stream-request-body (backend body params)
+  "Return BODY, a request plist, changed to ask BACKEND for a stream.
+It runs after `request-params' are merged and before `body-transform'.
+PARAMS are the resolved request parameters.")
+
+(cl-defmethod utter--stream-request-body ((_backend utter-backend) body _params)
+  "Return BODY unchanged."
+  body)
+
+(cl-defgeneric utter--stream-alignment-piece (backend info json)
+  "Return the alignment piece in one streamed JSON object, or nil.
+JSON is a parsed line or message of BACKEND's stream for request
+INFO.  A piece is (:characters STRING-OR-LIST :starts LIST :ends
+LIST) with absolute times in seconds; pieces are concatenated in
+order and must add up to a prefix of the request text.")
+
+(cl-defmethod utter--stream-alignment-piece ((_backend utter-backend) _info _json)
+  "Return nil: no alignment."
+  nil)
+
+(cl-defgeneric utter--stream-open (backend info params on-event)
+  "Start streaming the request INFO with PARAMS on BACKEND; return a handle.
+Only for `utter--stream-kind' `websocket'.  ON-EVENT takes
+\(:status N), (:start :format FORMAT), (:data BYTES), (:alignment
+PIECE) with PIECE as from `utter--stream-alignment-piece', (:end)
+when all audio has arrived, and (:error STRING).  The first (:end) or
+\(:error) finishes the request; later events are ignored.  The handle
+is closed by `utter--stream-close' when the request is aborted.")
+
+(cl-defmethod utter--stream-open ((backend utter-backend) _info _params _on-event)
+  "Signal an error: BACKEND has no streaming transport."
+  (error "Utter: backend %s does not implement `utter--stream-open'"
+         (utter-backend-name backend)))
+
+(cl-defgeneric utter--stream-close (backend handle)
+  "Close HANDLE, as returned by BACKEND's `utter--stream-open'.")
+
+(cl-defmethod utter--stream-close ((_backend utter-backend) handle)
+  "Delete HANDLE when it is a process."
+  (when (and (processp handle) (process-live-p handle))
+    (delete-process handle)))
+
+(cl-defstruct (utter--streaming (:constructor utter--make-streaming) (:copier nil))
+  "State of one streamed request.
+RAW collects the response body; AUDIO the decoded audio for kinds
+other than `bytes'.  HOLD keeps the first bytes until they are
+sniffed (nil once decided); LINE is an incomplete `b64-lines' line.
+CHARS, STARTS and ENDS concatenate the alignment pieces; EMITTED is
+the length of the last alignment prefix passed on."
+  req backend kind text params out raw audio callback on-audio
+  started format (hold "") (line "") (chars "") (starts []) (ends [])
+  (emitted 0) invalid error ended)
+
+(defun utter--stream-emit (st event)
+  "Pass EVENT to the stream callback of ST while its request runs."
+  (when-let* ((cb (utter--streaming-callback st))
+              ((eq (utter-request-status (utter--streaming-req st)) 'running)))
+    (funcall cb event)))
+
+(defun utter--stream-start (st format)
+  "Mark ST as started with FORMAT and send (:start :format FORMAT)."
+  (unless (utter--streaming-started st)
+    (let ((req (utter--streaming-req st)))
+      (setf (utter--streaming-started st) t
+            (utter--streaming-format st) format
+            (utter-request-info req)
+            (plist-put (utter-request-info req) :stream-started t)))
+    (utter--stream-emit st (list :start :format format))))
+
+(defun utter--stream-data (st bytes &optional write)
+  "Send BYTES of audio for ST; with WRITE also append them to its audio file."
+  (let ((bytes (if (multibyte-string-p bytes) (encode-coding-string bytes 'binary) bytes)))
+    (when (> (length bytes) 0)
+      (when write
+        (let ((coding-system-for-write 'binary))
+          (write-region bytes nil (utter--streaming-audio st) t 'silent)))
+      (utter--stream-emit st (list :data bytes))
+      (utter--stream-flush-alignment st))))
+
+(defun utter--stream-add-piece (st piece)
+  "Append alignment PIECE to ST and pass on the grown prefix."
+  (when (and piece (not (utter--streaming-invalid st)))
+    (condition-case nil
+        (let* ((chars (plist-get piece :characters))
+               (chars (if (stringp chars) chars
+                        (mapconcat (lambda (c) (if (and (stringp c) (= (length c) 1)) c
+                                                 (error "Bad character")))
+                                   (utter--alignment-array-list chars) ""))))
+          (setf (utter--streaming-chars st) (concat (utter--streaming-chars st) chars)
+                (utter--streaming-starts st)
+                (vconcat (utter--streaming-starts st) (plist-get piece :starts))
+                (utter--streaming-ends st)
+                (vconcat (utter--streaming-ends st) (plist-get piece :ends))))
+      (error (setf (utter--streaming-invalid st) t)))
+    (utter--stream-flush-alignment st)))
+
+(defun utter--stream-flush-alignment (st)
+  "Send the validated alignment prefix of ST when it has grown.
+Nothing is sent before (:start).  Alignment that stops matching
+the text stops the events; the request itself goes on."
+  (let ((chars (utter--streaming-chars st)))
+    (when (and (utter--streaming-started st)
+               (not (utter--streaming-invalid st))
+               (> (length chars) (utter--streaming-emitted st)))
+      (if-let* ((prefix (utter--normalize-alignment-prefix
+                         (utter--streaming-text st) chars
+                         (utter--streaming-starts st) (utter--streaming-ends st))))
+          (progn (setf (utter--streaming-emitted st) (length chars))
+                 (utter--stream-emit st (list :alignment prefix)))
+        (setf (utter--streaming-invalid st) t)))))
+
+(defun utter--stream-alignment (st)
+  "Return the full validated alignment of ST, or nil."
+  (unless (utter--streaming-invalid st)
+    (utter--normalize-alignment (utter--streaming-text st) (utter--streaming-chars st)
+                                (utter--streaming-starts st) (utter--streaming-ends st))))
+
+(defun utter--stream-end (st)
+  "Send (:end) once for ST if it started."
+  (when (and (utter--streaming-started st) (not (utter--streaming-ended st)))
+    (setf (utter--streaming-ended st) t)
+    (utter--stream-emit st '(:end))))
+
+(defun utter--stream-audio-callback (st)
+  "Return the ON-AUDIO function for ST, adding its alignment on success."
+  (lambda (file result &optional _metadata)
+    (funcall (utter--streaming-on-audio st) file result
+             (and file (utter--stream-alignment st)))))
+
+(defun utter--stream-sniff (st)
+  "Decide from the held bytes of ST whether the body is audio.
+Audio starts the stream, as `utter--decode-bytes' would accept it:
+known audio, or for `pcm' anything that does not look like JSON
+or HTML.  Anything else stays in the raw file for the error path."
+  (let* ((head (utter--streaming-hold st))
+         (kind (utter--sniff (substring head 0 (min 64 (length head)))))
+         (format (plist-get (utter--streaming-params st) :format)))
+    (setf (utter--streaming-hold st) nil)
+    (when (if (eq format 'pcm) (not (memq kind '(json text empty))) (eq kind 'audio))
+      (utter--stream-start st (or (utter--container-magic head) format))
+      (utter--stream-data st head))))
+
+(defun utter--stream-filter (st chunk)
+  "Handle CHUNK of the streamed body of ST."
+  (let ((coding-system-for-write 'binary))
+    (write-region chunk nil (utter--streaming-raw st) t 'silent))
+  (pcase (utter--streaming-kind st)
+    ('bytes
+     (cond
+      ((utter--streaming-started st) (utter--stream-data st chunk))
+      ((utter--streaming-hold st)
+       (setf (utter--streaming-hold st) (concat (utter--streaming-hold st) chunk))
+       (when (>= (length (utter--streaming-hold st)) 64)
+         (utter--stream-sniff st)))))
+    ('b64-lines
+     (let ((data (concat (utter--streaming-line st) chunk))
+           (start 0))
+       (while-let ((nl (string-search "\n" data start)))
+         (utter--stream-json-line st (substring data start nl))
+         (setq start (1+ nl)))
+       (setf (utter--streaming-line st) (substring data start))))))
+
+(defun utter--stream-json-line (st line)
+  "Handle one LINE, a unibyte string, of a `b64-lines' body for ST.
+A JSON object with `audio_base64' carries audio, possibly empty, and
+maybe an alignment piece.  Before audio has started other lines are
+left to the error path; after, an object with an error message
+records the error."
+  (let ((json (and (string-match-p "[^ \t\r]" line)
+                   (condition-case nil
+                       (json-parse-string (decode-coding-string line 'utf-8)
+                                          :object-type 'alist :array-type 'list
+                                          :null-object nil :false-object :false)
+                     (error nil)))))
+    (when (and (consp json) (consp (car json)) (symbolp (caar json)))
+      (if (not (assq 'audio_base64 json))
+          (when (and (utter--streaming-started st) (not (utter--streaming-error st)))
+            (setf (utter--streaming-error st)
+                  (or (utter--error-from-json json) "utter: unexpected stream data")))
+        (let* ((b64 (alist-get 'audio_base64 json))
+               (bytes (cond ((null b64) "")
+                            ((stringp b64)
+                             (condition-case nil (base64-decode-string b64) (error nil))))))
+          (if (null bytes)
+              (unless (utter--streaming-error st)
+                (setf (utter--streaming-error st) "utter: invalid base64 audio"))
+            (when (and (> (length bytes) 0) (not (utter--streaming-started st)))
+              (utter--stream-start st (or (utter--container-magic bytes)
+                                          (plist-get (utter--streaming-params st) :format))))
+            (when (utter--streaming-started st)
+              (utter--stream-data st bytes t))
+            (utter--stream-add-piece
+             st (condition-case nil
+                    (utter--stream-alignment-piece
+                     (utter--streaming-backend st)
+                     (utter-request-info (utter--streaming-req st)) json)
+                  (error nil)))))))))
+
+(defun utter--stream-decode (st)
+  "Return the decode function for the finished curl stream ST.
+It is called like `utter--response-audio'.  A stream that never
+started is decoded like a whole `bytes' response, so its errors
+read as they would without streaming."
+  (lambda (backend rinfo callback)
+    (cond
+     ((not (utter--streaming-started st)) (utter--decode-bytes backend rinfo callback))
+     ((utter--streaming-error st) (funcall callback nil (utter--streaming-error st)))
+     ((eq (utter--streaming-kind st) 'bytes) (utter--decode-bytes backend rinfo callback))
+     (t (funcall callback (plist-get rinfo :file)
+                 (utter--write-audio (list :file (utter--streaming-audio st)) rinfo))))))
+
+(defun utter--stream-curl-done (st status err)
+  "Finish the curl stream ST with HTTP STATUS and curl error ERR."
+  (unless err
+    (pcase (utter--streaming-kind st)
+      ('bytes (when (and (utter--streaming-hold st) (not (utter--streaming-started st)))
+                (utter--stream-sniff st)))
+      ('b64-lines (utter--stream-json-line st (utter--streaming-line st))
+                  (setf (utter--streaming-line st) ""))))
+  (utter--stream-end st)
+  (utter--curl-response (utter--streaming-req st) (utter--streaming-backend st)
+                        (utter--streaming-text st) (utter--streaming-params st)
+                        (utter--streaming-out st) (utter--streaming-raw st) status err
+                        (utter--stream-decode st) (utter--stream-audio-callback st)))
+
+(defun utter--start-stream (req backend kind text params out on-audio callback)
+  "Start streaming REQ for TEXT on BACKEND with PARAMS into OUT.
+KIND is BACKEND's `utter--stream-kind'.  CALLBACK receives the
+stream events; ON-AUDIO is as for `utter--start-curl'."
+  (let* ((raw (make-temp-file "utter-raw"))
+         (audio (and (not (eq kind 'bytes)) (make-temp-file "utter-audio")))
+         (st (utter--make-streaming :req req :backend backend :kind kind :text text
+                                 :params params :out out :raw raw :audio audio
+                                 :callback callback :on-audio on-audio)))
+    (setf (utter-request-info req)
+          (plist-put (utter-request-info req) :temp-files (delq nil (list raw audio))))
+    (if (eq kind 'websocket)
+        (utter--start-stream-handle st)
+      (utter--start-curl-stream st))))
+
+(defun utter--start-curl-stream (st)
+  "Run curl for the stream ST, reading the body as it arrives.
+The status comes from curl's stderr, read by a pipe process kept as
+the `utter-stderr' property of the curl process.  ST finishes once
+both have closed."
+  (let* ((req (utter--streaming-req st))
+         (backend (utter--streaming-backend st))
+         (info (utter-request-info req))
+         (body (utter--request-body backend (utter--streaming-text st)
+                                    (utter--streaming-params st) t))
+         (data (utter--write-json-file body))
+         (url (utter--backend-url backend info))
+         (headers (utter--backend-headers backend info))
+         (errbuf (generate-new-buffer " *utter-curl-stderr*"))
+         (stderr (make-pipe-process :name "utter-curl-stderr" :buffer errbuf
+                                    :coding 'binary :noquery t :sentinel #'ignore))
+         proc
+         (done
+          (lambda (&rest _)
+            (when (and proc (not (process-live-p proc)) (not (process-live-p stderr))
+                       (not (process-get proc 'utter-done)))
+              (process-put proc 'utter-done t)
+              (let ((out (if (buffer-live-p errbuf)
+                             (with-current-buffer errbuf (buffer-string))
+                           "")))
+                (when (buffer-live-p errbuf) (kill-buffer errbuf))
+                (unless (process-get proc 'utter-aborted)
+                  (apply #'utter--stream-curl-done st
+                         (utter--curl-outcome (decode-coding-string out 'utf-8)
+                                              proc))))))))
+    (setf (utter-request-info req)
+          (plist-put info :temp-files (cons data (plist-get info :temp-files))))
+    (utter--log 'info "stream %s %s" (utter-backend-name backend) url)
+    (utter--log 'debug "body %s" (utter--json-encode body))
+    (set-process-sentinel stderr done)
+    (setq proc (make-process
+                :name "utter-curl" :buffer nil
+                :command (utter--curl-stream-args backend)
+                :connection-type 'pipe :noquery t
+                :coding '(binary . utf-8-unix)
+                :stderr stderr
+                :filter (lambda (_p chunk) (utter--stream-filter st chunk))
+                :sentinel done))
+    (process-put proc 'utter-stderr stderr)
+    (setf (utter-request-process req) proc)
+    (process-send-string proc (utter--curl-config url headers data nil))
+    (process-send-eof proc)
+    proc))
+
+(defun utter--start-stream-handle (st)
+  "Open the `websocket' stream ST with `utter--stream-open'.
+Events from the transport feed the same path as curl streams.
+Events sent while `utter--stream-open' runs, and any that follow
+before they are handled, wait for a timer, so CALLBACK never runs
+inside `utter-request'."
+  (let* ((req (utter--streaming-req st))
+         (deferring t)
+         (queued nil)
+         (backend (utter--streaming-backend st))
+         (finish
+          (lambda (err)
+            (unless (utter--streaming-ended st)
+              (setf (utter-request-handle req) nil)
+              (utter--stream-end st)
+              ;; Also marks a stream that never started as ended.
+              (setf (utter--streaming-ended st) t)
+              (let ((on-audio (utter--stream-audio-callback st)))
+                (condition-case e
+                    (cond
+                     (err (funcall on-audio nil err))
+                     ((not (utter--streaming-started st))
+                      (funcall on-audio nil "utter: response has no audio"))
+                     (t (funcall on-audio (utter--streaming-out st)
+                                 (utter--write-audio
+                                  (list :file (utter--streaming-audio st))
+                                  (append (list :file (utter--streaming-out st))
+                                          (utter--streaming-params st))))))
+                  (error (utter--finish req nil (error-message-string e))))))))
+         (dispatch
+          (lambda (event)
+            (when (and (not (utter--streaming-ended st))
+                       (eq (utter-request-status req) 'running))
+              (pcase (car event)
+                (:status (setf (utter-request-info req)
+                               (plist-put (utter-request-info req)
+                                          :http-status (cadr event))))
+                (:start (utter--stream-start
+                         st (or (plist-get (cdr event) :format)
+                                (plist-get (utter--streaming-params st) :format))))
+                (:data
+                 (let ((bytes (cadr event)))
+                   (unless (utter--streaming-started st)
+                     (utter--stream-start
+                      st (or (utter--container-magic bytes)
+                             (plist-get (utter--streaming-params st) :format))))
+                   (utter--stream-data st bytes t)))
+                (:alignment (utter--stream-add-piece st (cadr event)))
+                (:end (funcall finish nil))
+                (:error (funcall finish (or (cadr event) "utter: stream failed")))))))
+         (on-event
+          (lambda (event)
+            (if deferring (push event queued) (funcall dispatch event))))
+         (replay
+          (lambda (&optional err)
+            (setf (utter-request-timer req)
+                  (run-at-time
+                   0 nil
+                   (lambda ()
+                     (while queued
+                       (let ((events (nreverse queued)))
+                         (setq queued nil)
+                         (mapc dispatch events)))
+                     (setq deferring nil)
+                     (when err (funcall finish err))))))))
+    (utter--log 'info "stream %s" (utter-backend-name backend))
+    (condition-case e
+        (progn
+          (setf (utter-request-handle req)
+                (utter--stream-open backend (utter-request-info req)
+                                    (utter--streaming-params st) on-event))
+          (if queued (funcall replay) (setq deferring nil)))
+      (error (funcall replay (error-message-string e))))))
 
 (provide 'utter-core)
 ;;; utter-core.el ends here
