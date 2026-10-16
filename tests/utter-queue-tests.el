@@ -94,8 +94,9 @@
    :name "fake" :formats '(wav mp3)
    :command (lambda (file rate)
               (push (list file rate) utter-eng--played)
-              (list "sleep" utter-eng--play-seconds)))
-  "A player that sleeps instead of playing.")
+              (list "sleep" utter-eng--play-seconds))
+   :stdin-command (lambda (_rate _format &optional _offset) (list "cat")))
+  "A player that sleeps instead of playing, or reads a stream with cat.")
 
 (defun utter-eng--backend (&rest keys)
   "Return a fake backend; KEYS override the defaults."
@@ -188,6 +189,7 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
           (utter-eng--auto t) (utter-eng--messages nil)
           (utter-eng--play-seconds "0.2") (utter-eng--prunes 0)
           (global-mode-string nil)
+          (utter-streaming nil) (utter--stream-player-warned nil)
           ,@bindings)
      (cl-letf (((symbol-function 'utter-request) #'utter-eng--fake-request)
                ((symbol-function 'utter-abort) #'utter-eng--fake-abort)
@@ -1050,6 +1052,425 @@ BINDINGS are extra `let*' bindings evaluated after the defaults."
             (should (equal events '(6 0)))
             (should (eq (process-get proc 'utter-progress-timer) timer))
             (utter-stop)))))))
+
+;;;; Streaming
+
+(cl-defstruct (utter-eng-sbackend (:include utter-backend)
+                                  (:constructor utter-eng--make-sbackend))
+  "A fake backend that streams like an OpenAI-compatible server.")
+
+(cl-defmethod utter--stream-kind ((_backend utter-eng-sbackend))
+  "Return `bytes': the fake streaming backend streams."
+  'bytes)
+
+(defun utter-eng--stream-backend (&rest keys)
+  "Return a fake streaming backend; KEYS override the defaults."
+  (apply #'utter-eng--make-sbackend
+         (append keys
+                 (list :name "Fake" :models '(fake-model) :voices '("v1" "v2")
+                       :formats '(mp3) :max-chars 4096
+                       :capabilities '(streaming)))))
+
+(defun utter-eng--capture-player (file &rest keys)
+  "Return a player whose stdin process copies the stream into FILE.
+Each start is pushed onto `utter-eng--played': (stdin RATE OFFSET)
+for a stream, (FILE RATE OFFSET) for a file.  KEYS override slots."
+  (apply #'make-utter-player
+         (append keys
+                 (list :name "capture" :formats '(mp3 wav)
+                       :command (lambda (f rate &optional offset)
+                                  (push (list f rate offset) utter-eng--played)
+                                  (list "sleep" utter-eng--play-seconds))
+                       :stdin-command (lambda (rate _format &optional offset)
+                                        (push (list 'stdin rate offset) utter-eng--played)
+                                        (list "sh" "-c" (concat "cat > "
+                                                                (shell-quote-argument file))))))))
+
+(defun utter-eng--stream (n &rest events)
+  "Send EVENTS to the stream callback of the Nth fake request."
+  (let ((cb (plist-get (utter-eng-req-args (nth n utter-eng--requests)) :stream-callback)))
+    (dolist (event events) (funcall cb event))))
+
+(defun utter-eng--stream-finish (n &optional info)
+  "End the stream of the Nth fake request successfully, as core does.
+\(:end) and the final callback run in one step.  INFO is added."
+  (let ((req (nth n utter-eng--requests)))
+    (setf (utter-eng-req-answered req) t)
+    (utter-eng--stream n '(:end))
+    (funcall (utter-eng-req-callback req) utter-eng--audio-file
+             (append info (list :format 'mp3 :duration 0.2 :http-status 200
+                                :stream t :stream-started t)))))
+
+(defun utter-eng--stream-fail (n)
+  "Fail the started stream of the Nth fake request, as core does."
+  (let ((req (nth n utter-eng--requests)))
+    (setf (utter-eng-req-answered req) t)
+    (utter-eng--stream n '(:end))
+    (funcall (utter-eng-req-callback req) nil
+             (list :http-status 200 :error "curl: (18) transfer closed"
+                   :stream t :stream-started t))))
+
+(defun utter-eng--file-string (file)
+  "Return the bytes in FILE as a string."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(defun utter-eng--streamed-p (n)
+  "Return non-nil if the Nth fake request was asked to stream."
+  (plist-member (utter-eng-req-args (nth n utter-eng--requests)) :stream))
+
+(defmacro utter-eng-with-stream (bindings &rest body)
+  "Run BODY in `utter-eng-with-queue' set up for streaming.
+`out' names the file the capture player writes.  BINDINGS are extra."
+  (declare (indent 1))
+  `(let ((out (make-temp-file "utter-stream-out")))
+     (unwind-protect
+         (utter-eng-with-queue ((utter-streaming t) (utter-eng--auto nil)
+                                (utter-backend (utter-eng--stream-backend))
+                                (utter-player (utter-eng--capture-player out))
+                                ,@bindings)
+           ,@body)
+       (delete-file out))))
+
+(ert-deftest utter-queue-stream-off-never-passes-stream ()
+  (utter-eng-with-queue ((utter-backend (utter-eng--stream-backend)))
+    (utter-enqueue "Not streamed.")
+    (should (utter-eng--wait #'utter-eng--idle-p))
+    (should (= (length utter-eng--requests) 1))
+    (should-not (utter-eng--streamed-p 0))
+    (should-not (plist-member (utter-eng-req-args (car utter-eng--requests))
+                              :stream-callback))))
+
+(ert-deftest utter-queue-stream-eligible-p ()
+  (let ((utter-streaming t)
+        (b (utter-eng--stream-backend)))
+    (should (utter--stream-eligible-p b 'fake-model 'mp3))
+    ;; Stage 1 streams mp3 only.
+    (should-not (utter--stream-eligible-p b 'fake-model 'wav))
+    ;; The capability is opt-in even when the backend has a stream kind.
+    (should-not (utter--stream-eligible-p (utter-eng--stream-backend :capabilities nil)
+                                          'fake-model 'mp3))
+    ;; A backend with no stream kind.
+    (should-not (utter--stream-eligible-p (utter-eng--backend :capabilities '(streaming))
+                                          'fake-model 'mp3))
+    (let ((utter-streaming nil))
+      (should-not (utter--stream-eligible-p b 'fake-model 'mp3)))))
+
+(ert-deftest utter-queue-stream-plays-while-receiving ()
+  (utter-eng-with-stream ()
+    (let* ((item (utter-enqueue "Stream me."))
+           (seg (car (utter--item-segments item))))
+      (should (eq (plist-get (utter-eng-req-args (car utter-eng--requests)) :stream) t))
+      (should (eq (utter-eng--status) 'synthesizing))
+      (utter-eng--stream 0 '(:start :format mp3))
+      (should (eq (utter-eng--status) 'playing))
+      (should (eq (utter--segment-status seg) 'streaming))
+      (should (eq (utter-item-status item) 'playing))
+      (should (equal (car utter-eng--played) '(stdin 1.0 nil)))
+      (should (member "utter: playing \"Stream me.\"" utter-eng--messages))
+      (utter-eng--stream 0 '(:data "ID3abc") '(:data "def"))
+      (should (utter-eng--wait (lambda () (equal (utter-eng--file-string out) "ID3abcdef"))))
+      ;; No end of input yet: the player waits for more.
+      (utter-eng--wait #'ignore 0.1)
+      (should (process-live-p (utter--qstate-process utter--queue)))
+      (utter-eng--stream-finish 0)
+      (should (equal (utter--segment-file seg) utter-eng--audio-file))
+      (should (eq (utter--segment-status seg) 'playing))
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (eq (utter-item-status item) 'done))
+      (should (eq (utter--segment-status seg) 'done))
+      (should (= (length utter-eng--played) 1))
+      (should (equal (utter-eng--file-string out) "ID3abcdef")))))
+
+(ert-deftest utter-queue-stream-only-the-segment-about-to-play ()
+  (utter-eng-with-stream ((utter-backend (utter-eng--stream-backend :max-chars 20))
+                          (utter--first-segment-chars 20))
+    (let ((item (utter-enqueue (utter-eng--three-sentences))))
+      (should (= (length (utter--item-segments item)) 3))
+      (should (= (length utter-eng--requests) 2))
+      (should (utter-eng--streamed-p 0))
+      ;; Prefetched segments download whole.
+      (should-not (utter-eng--streamed-p 1))
+      (utter-stop))))
+
+(ert-deftest utter-queue-stream-not-for-cache-only-or-while-paused ()
+  (utter-eng-with-stream ()
+    (utter-enqueue "Cache me." :cache-only t)
+    (should-not (utter-eng--streamed-p 0))
+    (utter-stop))
+  (utter-eng-with-stream ()
+    (utter-enqueue "Pause first.")
+    (should (utter-eng--streamed-p 0))
+    ;; A 429 makes the segment wait to retry; the retry starts while paused.
+    (utter-eng--fail 0 429)
+    (utter-pause)
+    (should (utter-eng--wait (lambda () (= (length utter-eng--requests) 2)) 1))
+    (should-not (utter-eng--streamed-p 1))
+    (utter-stop)))
+
+(ert-deftest utter-queue-stream-afplay-only-warns-once ()
+  (let ((file-only (make-utter-player :name "file-only" :formats '(mp3 wav)
+                                      :command (lambda (_f _r) (list "sleep" "0.05")))))
+    (utter-eng-with-queue ((utter-streaming t)
+                           (utter-backend (utter-eng--stream-backend))
+                           (utter-player 'auto)
+                           (utter--player-candidates (list file-only)))
+      (should-not (utter--select-stream-player 'mp3))
+      (utter-enqueue "One.")
+      (utter-enqueue "Two.")
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (= (length utter-eng--requests) 2))
+      (should-not (utter-eng--streamed-p 0))
+      (should-not (utter-eng--streamed-p 1))
+      (should (= (cl-count "utter: streaming needs ffplay or mpv; playing whole audio instead"
+                           utter-eng--messages :test #'equal)
+                 1))
+      ;; Once per session: a later queue does not warn again.
+      (setq utter-eng--messages nil)
+      (utter-enqueue "Three.")
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should-not (cl-find-if (lambda (m) (and m (string-match-p "needs ffplay" m)))
+                              utter-eng--messages)))))
+
+(ert-deftest utter-queue-stream-final-without-start-plays-whole ()
+  (utter-eng-with-stream ()
+    (let ((item (utter-enqueue "Whole after all.")))
+      (should (utter-eng--streamed-p 0))
+      ;; The request asked to stream finished without any event.
+      (funcall (utter-eng-req-callback (car utter-eng--requests)) utter-eng--audio-file
+               (list :format 'mp3 :duration 0.2 :stream t :stream-started nil))
+      (should (equal (car utter-eng--played) (list utter-eng--audio-file 1.0 nil)))
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (eq (utter-item-status item) 'done)))))
+
+(ert-deftest utter-queue-stream-error-after-start-retries-once ()
+  (utter-eng-with-stream ((errors nil))
+    (let* ((utter-error-functions (list (lambda (_i e) (push e errors))))
+           (item (utter-enqueue "Flaky stream."))
+           (seg (car (utter--item-segments item))))
+      (utter-eng--stream 0 '(:start :format mp3) '(:data "ID3abc"))
+      (let ((first (utter--qstate-process utter--queue)))
+        (utter-eng--stream-fail 0)
+        (should-not (process-live-p first)))
+      ;; Retried from the start, streaming again, with no error shown.
+      (should (= (length utter-eng--requests) 2))
+      (should (utter-eng--streamed-p 1))
+      (should-not errors)
+      (should (eq (utter--segment-status seg) 'synthesizing))
+      (should (= (utter--item-position item) 0))
+      (utter-eng--stream 1 '(:start :format mp3) '(:data "ID3"))
+      (should (eq (utter--segment-status seg) 'streaming))
+      (let ((second (utter--qstate-process utter--queue)))
+        (utter-eng--stream-fail 1)
+        (should-not (process-live-p second)))
+      ;; The second failure goes the usual way.
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (= (length utter-eng--requests) 2))
+      (should (eq (utter--segment-status seg) 'error))
+      (should (eq (utter-item-status item) 'error))
+      (should (equal errors '("Fake: curl: (18) transfer closed"))))))
+
+(ert-deftest utter-queue-stream-pause-buffers-and-resume-flushes ()
+  (utter-eng-with-stream ()
+    (let* ((item (utter-enqueue "Pause the stream."))
+           (seg (car (utter--item-segments item))))
+      (utter-eng--stream 0 '(:start :format mp3) '(:data "aaa"))
+      (should (utter-eng--wait (lambda () (equal (utter-eng--file-string out) "aaa"))))
+      (let ((proc (utter--qstate-process utter--queue)))
+        (utter-pause)
+        (should (utter-eng--wait (lambda () (eq (process-status proc) 'stop)) 1))
+        ;; Data and the end of the stream wait while paused.
+        (utter-eng--stream 0 '(:data "bbb"))
+        (utter-eng--stream-finish 0)
+        (utter-eng--wait #'ignore 0.2)
+        (should (process-live-p proc))
+        (should (equal (utter-eng--file-string out) "aaa"))
+        (utter-resume)
+        (should (eq (utter--qstate-process utter--queue) proc))
+        (should (utter-eng--wait #'utter-eng--idle-p))
+        (should (equal (utter-eng--file-string out) "aaabbb"))
+        (should (eq (utter-item-status item) 'done))
+        (should (eq (utter--segment-status seg) 'done))))))
+
+(ert-deftest utter-queue-stream-restart-resume-replays-stream-or-file ()
+  ;; ffplay skips the paused stretch on SIGCONT, also on a pipe, so a
+  ;; restarting player starts again: from the stream, or from the file
+  ;; once the stream has ended.
+  (utter-eng-with-stream ((utter-player (utter-eng--capture-player
+                                         out :resume #'utter-player-restart))
+                          (utter-eng--play-seconds "0.2"))
+    (let ((item (utter-enqueue "Restart the stream.")))
+      (utter-eng--stream 0 '(:start :format mp3) '(:data "aaa"))
+      (utter-eng--wait #'ignore 0.15)
+      (let ((first (utter--qstate-process utter--queue)))
+        (utter-pause)
+        (utter-eng--stream 0 '(:data "bbb"))
+        (utter-resume)
+        (should-not (process-live-p first)))
+      (let ((second (utter--qstate-process utter--queue))
+            (start (car utter-eng--played)))
+        (should (process-live-p second))
+        (should (eq (car start) 'stdin))
+        (should (and (numberp (nth 2 start)) (< 0.05 (nth 2 start) 0.8)))
+        ;; The new player is given everything received so far.
+        (should (utter-eng--wait (lambda () (equal (utter-eng--file-string out) "aaabbb"))))
+        (utter-eng--stream 0 '(:data "ccc"))
+        (should (utter-eng--wait (lambda () (equal (utter-eng--file-string out) "aaabbbccc"))))
+        ;; The stream ends while paused: resume plays the file.
+        (utter-pause)
+        (utter-eng--stream-finish 0)
+        (utter-resume)
+        (should-not (process-live-p second)))
+      (should (equal (car (car utter-eng--played)) utter-eng--audio-file))
+      (should (numberp (nth 2 (car utter-eng--played))))
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (eq (utter-item-status item) 'done)))))
+
+(ert-deftest utter-queue-stream-pause-before-start-plays-file ()
+  (utter-eng-with-stream ()
+    (let ((item (utter-enqueue "Paused early.")))
+      (utter-pause)
+      (utter-eng--stream 0 '(:start :format mp3) '(:data "aaa"))
+      (should-not (utter--qstate-process utter--queue))
+      (should-not utter-eng--played)
+      (utter-eng--stream-finish 0)
+      (should (eq (utter--segment-status (car (utter--item-segments item))) 'ready))
+      (utter-resume)
+      (should (equal (car utter-eng--played) (list utter-eng--audio-file 1.0 nil)))
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (eq (utter-item-status item) 'done)))))
+
+(ert-deftest utter-queue-stream-player-exit-mid-stream-is-an-error ()
+  (utter-eng-with-stream ((errors nil)
+                          (utter-player (make-utter-player
+                                         :name "quitter" :formats '(mp3)
+                                         :command (lambda (_f _r) (list "true"))
+                                         :stdin-command (lambda (&rest _) (list "true")))))
+    (let* ((utter-error-functions (list (lambda (_i e) (push e errors))))
+           (item (utter-enqueue "Gone early.")))
+      (utter-eng--stream 0 '(:start :format mp3))
+      (should (utter-eng--wait #'utter-eng--idle-p))
+      (should (utter-eng-req-aborted (car utter-eng--requests)))
+      (should (eq (utter-item-status item) 'error))
+      (should (= (length utter-eng--requests) 1))
+      (should (cl-some (lambda (e) (string-match-p "player" e)) errors)))))
+
+(ert-deftest utter-queue-stream-stop-aborts-the-request ()
+  (utter-eng-with-stream ()
+    (let ((item (utter-enqueue "Stop the stream.")))
+      (utter-eng--stream 0 '(:start :format mp3) '(:data "aaa"))
+      (let ((proc (utter--qstate-process utter--queue)))
+        (utter-stop)
+        (should (utter-eng--idle-p))
+        (should (utter-eng-req-aborted (car utter-eng--requests)))
+        (should (utter-eng--wait (lambda () (not (process-live-p proc))) 1))
+        (should (eq (utter-item-status item) 'interrupted))
+        (should (eq (utter--segment-status (car (utter--item-segments item))) 'pending))))))
+
+(defun utter-eng--prefix (alignment n)
+  "Return the first N characters of ALIGNMENT, as core streams them."
+  (list :characters (substring (plist-get alignment :characters) 0 n)
+        :starts (substring (plist-get alignment :starts) 0 n)
+        :ends (substring (plist-get alignment :ends) 0 n)))
+
+(ert-deftest utter-queue-stream-cues-grow-with-alignment ()
+  (let (events)
+    (utter-eng-with-stream ((utter-highlight t)
+                            (utter-progress-functions
+                             (list #'utter--highlight-progress
+                                   (lambda (_item start end) (push (cons start end) events)))))
+      (utter-eng-with-source "Hello Bill. This is a test."
+        (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                    :source-buffer (current-buffer)))
+               (seg (car (utter--item-segments item)))
+               (full (utter-eng--word-alignment (utter-item-text item) 0.1)))
+          (utter-eng--stream 0 '(:start :format mp3))
+          ;; No timing yet: the whole segment is shown.
+          (should (equal (utter-eng--overlay-text utter--highlight-overlay)
+                         "Hello Bill. This is a test."))
+          ;; Only sentences whose end is covered get a cue.
+          (utter-eng--stream 0 (list :alignment (utter-eng--prefix full 8)))
+          (should-not (utter--segment-cues seg))
+          (utter-eng--stream 0 (list :alignment (utter-eng--prefix full 14)))
+          (should (= (length (utter--segment-cues seg)) 1))
+          (should (equal (utter-eng--overlay-text utter--highlight-overlay) "Hello Bill. "))
+          (let ((cues (utter--segment-cues seg)))
+            (utter-eng--stream 0 (list :alignment full))
+            ;; Appended in place, so the running tick sees the new cue.
+            (should (eq (utter--segment-cues seg) cues))
+            (should (= (length cues) 2))
+            (should (utter-eng--wait
+                     (lambda () (equal (utter-eng--overlay-text utter--highlight-overlay)
+                                       "This is a test."))))
+            ;; The whole alignment at the end adds nothing new.
+            (utter-eng--stream-finish 0 (list :alignment full))
+            (should (eq (utter--segment-cues seg) cues))
+            (should (= (length cues) 2)))
+          (should (equal (reverse events) '((0 . 27) (0 . 12) (12 . 27))))
+          (utter-stop))))))
+
+(ert-deftest utter-queue-stream-word-cues-grow-with-alignment ()
+  (utter-eng-with-stream ((utter-highlight 'word))
+    (utter-eng-with-source "Hello Bill. This is a test."
+      (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                  :source-buffer (current-buffer)))
+             (seg (car (utter--item-segments item)))
+             (full (utter-eng--word-alignment (utter-item-text item) 100)))
+        (utter-eng--stream 0 '(:start :format mp3)
+                           (list :alignment (utter-eng--prefix full 8)))
+        (should (= (length (utter--segment-cues seg)) 1))
+        (should (equal (utter-eng--overlay-text utter--highlight-word-overlay) "Hello"))
+        (utter-eng--stream 0 (list :alignment (utter-eng--prefix full 19)))
+        (should (= (length (utter--segment-cues seg)) 4))
+        (utter-eng--stream-finish 0 (list :alignment full))
+        (should (equal (mapcar (lambda (c) (aref c 1)) (utter--segment-cues seg))
+                       '(0 6 12 17 20 22)))
+        (utter-stop)))))
+
+(ert-deftest utter-queue-stream-retry-drops-partial-cues ()
+  (utter-eng-with-stream ((utter-highlight t))
+    (utter-eng-with-source "Hello Bill. This is a test."
+      (let* ((item (utter-enqueue (utter--buffer-text (point-min) (point-max))
+                                  :source-buffer (current-buffer)))
+             (seg (car (utter--item-segments item)))
+             (full (utter-eng--word-alignment (utter-item-text item) 0.1)))
+        (utter-eng--stream 0 '(:start :format mp3)
+                           (list :alignment (utter-eng--prefix full 14)))
+        (let ((old (car (utter--segment-cues seg))))
+          (utter-eng--stream-fail 0)
+          (should-not (utter--segment-cues seg))
+          (should-not (marker-buffer (aref old 3))))
+        (utter-eng--stream 1 '(:start :format mp3) (list :alignment full))
+        (should (= (length (utter--segment-cues seg)) 2))
+        (utter-stop)))))
+
+(ert-deftest utter-queue-stream-player-commands ()
+  (should-not (utter-player-stdin-command utter-player-afplay))
+  (should (equal (funcall (utter-player-stdin-command utter-player-ffplay) 1.0 'mp3)
+                 '("ffplay" "-nodisp" "-autoexit" "-infbuf" "-loglevel" "error"
+                   "-af" "atempo=1.0" "-i" "pipe:0")))
+  ;; ffplay cannot seek a pipe; atrim drops the audio before the offset.
+  (should (equal (funcall (utter-player-stdin-command utter-player-ffplay) 1.5 'mp3 2.5)
+                 '("ffplay" "-nodisp" "-autoexit" "-infbuf" "-loglevel" "error"
+                   "-af" "atrim=start=2.50,atempo=1.5" "-i" "pipe:0")))
+  (should (equal (funcall (utter-player-stdin-command utter-player-mpv) 1.2 'mp3)
+                 '("mpv" "--no-video" "--speed=1.2" "-")))
+  (let* ((file-only (make-utter-player :name "file-only" :formats '(mp3)
+                                       :command (lambda (_f _r) (list "sleep" "0"))))
+         (piped (make-utter-player :name "piped" :formats '(mp3)
+                                   :command (lambda (_f _r) (list "sleep" "0"))
+                                   :stdin-command (lambda (&rest _) (list "cat"))))
+         (utter--player-candidates (list file-only piped))
+         (utter-player 'auto))
+    (should (eq (utter--select-player 'mp3) file-only))
+    (should (eq (utter--select-stream-player 'mp3) piped))
+    (should-not (utter--select-stream-player 'wav))
+    (let ((utter-player file-only))
+      (should-not (utter--select-stream-player 'mp3)))
+    (let ((utter-player 'utter-eng--player))
+      (should (eq (utter--select-stream-player 'mp3) utter-eng--player)))))
 
 (ert-deftest utter-queue-item-private-accessors ()
   (utter-eng-with-queue ((utter-eng--auto nil))

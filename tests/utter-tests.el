@@ -39,7 +39,7 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
                     (utter-instructions . nil) (utter-highlight . nil)
                     (utter-highlight-follow . nil) (utter-lighter . " ♪%i/%n")
                     (utter-prefetch-depth . 2) (utter-max-concurrent-requests . 2)
-                    (utter-player . auto)
+                    (utter-player . auto) (utter-streaming . nil)
                     (utter-input-functions . (utter--gptel-response-at-point
                                               utter--org-subtree-at-point
                                               utter--page-at-point))
@@ -300,6 +300,30 @@ Inside BODY, `calls' is a list of (FUNCTION TEXT PARAMS), newest first."
         (utter--inspect-text "Given text."))
       (with-current-buffer "*utter-inspect*"
         (should (string-match-p "Given text" (buffer-string))))
+      (kill-buffer "*utter-inspect*"))))
+
+(ert-deftest utter-inspect-query-shows-stream-only-when-streaming ()
+  (utter-eng-with-queue ((utter-backend (utter-eng--stream-backend))
+                         (calls nil))
+    (cl-letf (((symbol-function 'utter-request)
+               (lambda (_text &rest args)
+                 (push args calls)
+                 (list :url "https://example.invalid/v1/audio/speech"
+                       :stream (plist-get args :stream)))))
+      ;; Off by default: the key is not passed at all.
+      (with-temp-buffer (utter--inspect-text "Not streamed."))
+      (should-not (plist-member (car calls) :stream))
+      (let ((utter-streaming t))
+        (with-temp-buffer (utter--inspect-text "Streamed."))
+        (should (eq (plist-get (car calls) :stream) t))
+        (with-current-buffer "*utter-inspect*"
+          (should (string-match-p ":stream t" (buffer-string))))
+        ;; No player reads a pipe: the request would not stream.
+        (let ((utter-player (make-utter-player
+                             :name "file-only" :formats '(mp3)
+                             :command (lambda (_f _r) (list "sleep" "0")))))
+          (with-temp-buffer (utter--inspect-text "Whole."))
+          (should-not (plist-member (car calls) :stream))))
       (kill-buffer "*utter-inspect*"))))
 
 (ert-deftest utter-select-voice-sets-with-scope ()

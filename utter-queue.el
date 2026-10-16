@@ -55,6 +55,8 @@
 (declare-function utter--formats "utter-core" (backend &optional model))
 (declare-function utter--capable-p "utter-core" (backend model capability))
 (declare-function utter-cache-prune "utter-core" (&optional max-size))
+(declare-function utter--stream-kind "utter-core" (backend))
+(declare-function utter--stream-available-p "utter-core" (backend))
 
 ;;;; Options (defined in utter.el)
 
@@ -73,6 +75,7 @@
 (defvar utter-prefetch-depth)
 (defvar utter-max-concurrent-requests)
 (defvar utter-player)
+(defvar utter-streaming)
 
 ;;;; Hooks
 
@@ -139,10 +142,20 @@ private; use `utter--item-segments' and `utter--item-position'."
 (cl-defstruct (utter--segment (:constructor utter--make-segment) (:copier nil))
   "A request-sized piece of an utterance.  Private.
 STATUS is one of `pending', `synthesizing', `retry', `ready',
-`playing', `done' or `error'.  START and END are positions in the
-item text."
+`streaming' (played while its audio arrives), `playing', `done' or
+`error'.  START and END are positions in the item text.  FEED is
+the `utter--feed' of a request asked to stream."
   index text status file request error duration start end format source-text cues
-  (retries 0))
+  (retries 0) feed)
+
+(cl-defstruct (utter--feed (:constructor utter--make-feed) (:copier nil))
+  "The audio of a segment played while it arrives.  Private.
+PROCESS is the player reading it from a pipe.  BYTES holds every
+piece received and PENDING those not yet written while paused,
+newest first.  ENDED is set by (:end) and EOF-SENT once the player
+was told.  OFF means the stream is not played: the segment waits
+for its whole file, as without streaming."
+  process bytes pending ended eof-sent off)
 
 (defsubst utter--item-segments (item)
   "Return the segments of ITEM."
@@ -182,8 +195,12 @@ utterances counted by the lighter since the queue was last idle."
 (cl-defstruct utter-player
   "An external audio player.
 COMMAND is a function of (FILE RATE) returning the argument list.
-PAUSE, RESUME and STOP are functions of the player process."
-  name formats command
+STDIN-COMMAND, or nil for a player that cannot read a pipe, is a
+function of (RATE FORMAT &optional OFFSET) returning the argument
+list of the player reading audio in FORMAT from its standard input,
+skipping OFFSET seconds of it.  PAUSE, RESUME and STOP are functions
+of the player process."
+  name formats command stdin-command
   (pause #'utter-player-sigstop)
   (resume #'utter-player-sigcont)
   (stop #'delete-process))
@@ -193,8 +210,10 @@ PAUSE, RESUME and STOP are functions of the player process."
   (signal-process process 'SIGSTOP))
 
 (defun utter-player-sigcont (process)
-  "Resume PROCESS with SIGCONT."
-  (signal-process process 'SIGCONT))
+  "Resume PROCESS with SIGCONT.
+`continue-process' also marks it running, which Emacs needs before
+it writes to the process again."
+  (continue-process process))
 
 (defun utter-player-restart (process)
   "Resume the paused player PROCESS by starting it again where it stopped.
@@ -230,7 +249,15 @@ seconds of audio.  Return the new process."
    :command (lambda (file rate &optional offset)
               (append (list "ffplay" "-nodisp" "-autoexit" "-loglevel" "error")
                       (and offset (list "-ss" (format "%.2f" offset)))
-                      (list "-af" (concat "atempo=" (utter--rate-string rate)) file))))
+                      (list "-af" (concat "atempo=" (utter--rate-string rate)) file)))
+   ;; -infbuf: without it ffplay reads only about a second ahead, so
+   ;; the pipe fills and writing to it blocks Emacs.  A pipe cannot be
+   ;; seeked; atrim decodes and drops the audio before OFFSET.
+   :stdin-command (lambda (rate _format &optional offset)
+                    (list "ffplay" "-nodisp" "-autoexit" "-infbuf" "-loglevel" "error"
+                          "-af" (concat (and offset (format "atrim=start=%.2f," offset))
+                                        "atempo=" (utter--rate-string rate))
+                          "-i" "pipe:0")))
   "The ffplay player from FFmpeg.")
 
 (defvar utter-player-mpv
@@ -238,7 +265,10 @@ seconds of audio.  Return the new process."
    :name "mpv" :formats '(mp3 wav aiff m4a aac flac opus ogg)
    :command (lambda (file rate)
               (list "mpv" "--no-video"
-                    (concat "--speed=" (utter--rate-string rate)) file)))
+                    (concat "--speed=" (utter--rate-string rate)) file))
+   :stdin-command (lambda (rate _format &optional _offset)
+                    (list "mpv" "--no-video"
+                          (concat "--speed=" (utter--rate-string rate)) "-")))
   "The mpv player.")
 
 (defvar utter--player-candidates
@@ -267,6 +297,20 @@ PLAYER is a player or a symbol whose value is one."
         (utter--resolve-player choice)
       (cl-find-if (lambda (p)
                     (and p
+                         (or (null format) (memq format (utter-player-formats p)))
+                         (utter--player-installed-p p)))
+                  (mapcar #'utter--resolve-player utter--player-candidates)))))
+
+(defun utter--select-stream-player (format)
+  "Return the player to read audio in FORMAT from a pipe, or nil.
+Like `utter--select-player', but only players with a
+`stdin-command' qualify; afplay has none."
+  (let ((choice (default-value 'utter-player)))
+    (if (not (eq choice 'auto))
+        (let ((p (utter--resolve-player choice)))
+          (and p (utter-player-stdin-command p) p))
+      (cl-find-if (lambda (p)
+                    (and p (utter-player-stdin-command p)
                          (or (null format) (memq format (utter-player-formats p)))
                          (utter--player-installed-p p)))
                   (mapcar #'utter--resolve-player utter--player-candidates)))))
@@ -875,10 +919,22 @@ cue the word in `utter-highlight' and its sentence in
 
 (defun utter--segment-callback (item seg audio info)
   "Handle the `utter-request' result AUDIO and INFO for SEG of ITEM."
-  (when (and (eq (utter--segment-status seg) 'synthesizing)
+  (when (and (memq (utter--segment-status seg) '(synthesizing streaming))
              (utter--live-item-p item))
     (setf (utter--segment-request seg) nil)
+    (unless (and (stringp audio) (eq (utter--segment-status seg) 'streaming))
+      (utter--feed-teardown seg))
     (cond
+     ((and (stringp audio) (eq (utter--segment-status seg) 'streaming))
+      ;; The player has the audio already; keep it playing.
+      (setf (utter--segment-file seg) audio
+            (utter--segment-format seg)
+            (utter--format-symbol (or (plist-get info :format)
+                                      (file-name-extension audio)))
+            (utter--segment-duration seg) (plist-get info :duration)
+            (utter--segment-status seg) 'playing)
+      (when-let* ((alignment (plist-get info :alignment)))
+        (utter--feed-alignment item seg alignment)))
      ((stringp audio)
       (setf (utter--segment-file seg) audio
             (utter--segment-format seg)
@@ -892,6 +948,17 @@ cue the word in `utter-highlight' and its sentence in
             (utter--segment-status seg) 'ready))
      ((eq audio 'abort)
       (utter--segment-failed item seg "request aborted"))
+     ((plist-get info :stream-started)
+      ;; Audio had started, so the error is no HTTP status: retry the
+      ;; whole segment once, from its start.
+      (let ((error (or (plist-get info :error) "request failed")))
+        (if (< (utter--segment-retries seg) 1)
+            (progn
+              (cl-incf (utter--segment-retries seg))
+              (setf (utter--segment-status seg) 'pending)
+              (message "utter: %s stopped sending audio, retrying"
+                       (utter--backend-name item)))
+          (utter--segment-failed item seg error))))
      (t
       (let ((code (plist-get info :http-status))
             (error (or (plist-get info :error) "request failed")))
@@ -913,13 +980,23 @@ cue the word in `utter-highlight' and its sentence in
     (utter--schedule)))
 
 (defun utter--request-segment (item seg)
-  "Start synthesizing SEG of ITEM."
-  (setf (utter--segment-status seg) 'synthesizing)
+  "Start synthesizing SEG of ITEM.
+Ask for a stream when `utter--stream-wanted-p'."
+  (setf (utter--segment-status seg) 'synthesizing
+        (utter--segment-feed seg) (and (utter--stream-wanted-p item seg)
+                                       (utter--make-feed)))
   (condition-case err
-      (let ((req (apply #'utter-request (utter--segment-text seg)
-                        :callback (lambda (audio info)
-                                    (utter--segment-callback item seg audio info))
-                        (utter--request-args item seg))))
+      (let* ((feed (utter--segment-feed seg))
+             (req (apply #'utter-request (utter--segment-text seg)
+                         :callback (lambda (audio info)
+                                     (utter--segment-callback item seg audio info))
+                         (append
+                          (and feed
+                               (list :stream t
+                                     :stream-callback
+                                     (lambda (event)
+                                       (utter--feed-event item seg feed event))))
+                          (utter--request-args item seg)))))
         (when (eq (utter--segment-status seg) 'synthesizing)
           (setf (utter--segment-request seg) req)))
     (error
@@ -930,8 +1007,9 @@ cue the word in `utter-highlight' and its sentence in
   "Abort the in-flight requests and retries of ITEM."
   (dolist (seg (utter--item-segments item))
     (pcase (utter--segment-status seg)
-      ('synthesizing
+      ((or 'synthesizing 'streaming)
        (let ((req (utter--segment-request seg)))
+         (utter--feed-teardown seg)
          (setf (utter--segment-status seg) 'pending
                (utter--segment-request seg) nil)
          (when req (ignore-errors (utter-abort req)))))
@@ -948,7 +1026,7 @@ cue the word in `utter-highlight' and its sentence in
     (dolist (item (utter--qstate-items q))
       (dolist (seg (utter--item-segments item))
         ;; A segment waiting to retry keeps its slot.
-        (when (memq (utter--segment-status seg) '(synthesizing retry))
+        (when (memq (utter--segment-status seg) '(synthesizing streaming retry))
           (cl-incf in-flight))))
     (catch 'full
       (dolist (item (cons current
@@ -1014,8 +1092,7 @@ cue the word in `utter-highlight' and its sentence in
 
 (defun utter--play-segment (item seg)
   "Start the player on SEG of ITEM."
-  (let* ((q utter--queue)
-         (player (utter--select-player (utter--segment-format seg)))
+  (let* ((player (utter--select-player (utter--segment-format seg)))
          (argv (and player
                     (funcall (utter-player-command player) (utter--segment-file seg)
                              (default-value 'utter-playback-rate))))
@@ -1028,26 +1105,31 @@ cue the word in `utter-highlight' and its sentence in
                                                (error-message-string err)))
                              nil)))))
     (cond
-     (proc
-      (setf (utter--segment-status seg) 'playing
-            (utter--qstate-process q) proc
-            (utter--qstate-seg-start q) (float-time)
-            (utter--qstate-pause-start q) nil
-            (utter--qstate-paused-total q) 0)
-      (unless (eq (utter--qstate-announced q) item)
-        (setf (utter--qstate-announced q) item)
-        (let ((n (length (utter--qstate-run q))))
-          (message "utter: playing %s%s" (utter-item-source-name item)
-                   (if (> n 1) (format " (%d/%d)" (utter--run-index item) n) ""))))
-      (if (utter--segment-cues seg)
-          (utter--progress-start proc)
-        (run-hook-with-args 'utter-progress-functions item
-                            (utter--segment-start seg) (utter--segment-end seg))))
+     (proc (utter--player-started item seg proc 'playing))
      ((not player)
       (utter--segment-failed
        item seg (format "no player for %s audio; install ffplay or mpv, or set `utter-player'"
                         (or (utter--segment-format seg) "this")))))
     proc))
+
+(defun utter--player-started (item seg proc status)
+  "Make PROC the player of SEG of ITEM, which gets STATUS.
+Announce ITEM the first time and show where it is."
+  (let ((q utter--queue))
+    (setf (utter--segment-status seg) status
+          (utter--qstate-process q) proc
+          (utter--qstate-seg-start q) (float-time)
+          (utter--qstate-pause-start q) nil
+          (utter--qstate-paused-total q) 0)
+    (unless (eq (utter--qstate-announced q) item)
+      (setf (utter--qstate-announced q) item)
+      (let ((n (length (utter--qstate-run q))))
+        (message "utter: playing %s%s" (utter-item-source-name item)
+                 (if (> n 1) (format " (%d/%d)" (utter--run-index item) n) ""))))
+    (if (utter--segment-cues seg)
+        (utter--progress-start proc)
+      (run-hook-with-args 'utter-progress-functions item
+                          (utter--segment-start seg) (utter--segment-end seg)))))
 
 (defun utter--start-player-process (argv player seg rate)
   "Start ARGV as the process of PLAYER playing SEG at RATE."
@@ -1070,17 +1152,19 @@ cue the word in `utter-highlight' and its sentence in
     (let ((seg (process-get proc 'utter-segment))
           (item (utter--qstate-current utter--queue)))
       (utter--account-segment)
-      (setf (utter--qstate-process utter--queue) nil
-            (utter--segment-status seg) 'done)
-      (when (and (eq (process-status proc) 'exit)
-                 (/= (process-exit-status proc) 0)
-                 (not (process-get proc 'utter-was-paused))
-                 item)
-        (run-hook-with-args 'utter-error-functions item
-                            (format "player exited with status %d"
-                                    (process-exit-status proc))))
-      (when item (cl-incf (utter--item-position item)))
-      (utter--schedule))))
+      (setf (utter--qstate-process utter--queue) nil)
+      (if (eq (utter--segment-status seg) 'streaming)
+          (utter--feed-player-died item seg)
+        (setf (utter--segment-status seg) 'done)
+        (when (and (eq (process-status proc) 'exit)
+                   (/= (process-exit-status proc) 0)
+                   (not (process-get proc 'utter-was-paused))
+                   item)
+          (run-hook-with-args 'utter-error-functions item
+                              (format "player exited with status %d"
+                                      (process-exit-status proc))))
+        (when item (cl-incf (utter--item-position item)))
+        (utter--schedule)))))
 
 (defun utter--kill-player ()
   "Stop the player without advancing the queue."
@@ -1089,8 +1173,15 @@ cue the word in `utter-highlight' and its sentence in
       (utter--progress-stop proc)
       (process-put proc 'utter-stopped t)
       (let ((seg (process-get proc 'utter-segment)))
-        (when (and seg (eq (utter--segment-status seg) 'playing))
-          (setf (utter--segment-status seg) 'ready)))
+        (pcase (and seg (utter--segment-status seg))
+          ('playing (setf (utter--segment-status seg) 'ready))
+          ;; A stream without its player is of no use: start over later.
+          ('streaming
+           (let ((req (utter--segment-request seg)))
+             (utter--feed-drop seg)
+             (setf (utter--segment-status seg) 'pending
+                   (utter--segment-request seg) nil)
+             (when req (ignore-errors (utter-abort req)))))))
       (utter--account-segment)
       (setf (utter--qstate-process q) nil)
       (ignore-errors
@@ -1152,6 +1243,232 @@ cue the word in `utter-highlight' and its sentence in
         (utter--prefetch))))
   (unless utter--scheduling
     (utter--changed)))
+
+;;;; Streaming
+
+(defvar utter--stream-player-warned nil
+  "Non-nil once utter said that no player can read a stream.")
+
+(defun utter--stream-eligible-p (backend model format)
+  "Return non-nil if audio from BACKEND and MODEL in FORMAT may stream.
+That needs `utter-streaming', the `streaming' capability, a stream
+transport available now, and mp3 audio.  Players are not checked;
+see `utter--select-stream-player'."
+  (and (default-value 'utter-streaming)
+       (eq (utter--format-symbol format) 'mp3)
+       (utter--capable-p backend model 'streaming)
+       (utter--stream-kind backend)
+       (utter--stream-available-p backend)
+       t))
+
+(defun utter--stream-wanted-p (item seg)
+  "Return non-nil if SEG of ITEM should play while its audio arrives.
+Only the segment about to play qualifies, with no player running,
+playback not paused and ITEM not cache-only; later segments are
+prefetched whole.  When no player reads a pipe, say so once."
+  (let ((q utter--queue)
+        (p (utter-item-params item)))
+    (and (eq item (utter--qstate-current q))
+         (= (utter--segment-index seg) (utter--item-position item))
+         (not (utter--qstate-process q))
+         (not (utter--qstate-paused q))
+         (not (plist-get p :cache-only))
+         (utter--stream-eligible-p (plist-get p :backend) (plist-get p :model)
+                                   (plist-get p :format))
+         (or (utter--select-stream-player (plist-get p :format))
+             (progn
+               (unless utter--stream-player-warned
+                 (setq utter--stream-player-warned t)
+                 (message "utter: streaming needs ffplay or mpv; playing whole audio instead"))
+               nil)))))
+
+(defun utter--feed-event (item seg feed event)
+  "Handle the stream EVENT of FEED, the arriving audio of SEG of ITEM."
+  (when (and (eq feed (utter--segment-feed seg)) (not (utter--feed-off feed)))
+    (pcase (car event)
+      (:start (utter--feed-start item seg feed (plist-get (cdr event) :format)))
+      (:data (when (utter--feed-process feed)
+               (utter--feed-write feed (cadr event))))
+      (:alignment (when (utter--feed-process feed)
+                    (utter--feed-alignment item seg (cadr event))))
+      (:end (setf (utter--feed-ended feed) t)
+            (utter--feed-flush feed)))))
+
+(defun utter--feed-start (item seg feed format)
+  "Start playing FEED, the arriving audio of SEG of ITEM, in FORMAT.
+When there is no player for it, or playback has moved on or is
+paused, the stream is not played and SEG waits for its whole file."
+  (let* ((q utter--queue)
+         (format (utter--format-symbol format))
+         (player (and (eq (utter--segment-status seg) 'synthesizing)
+                      (eq item (utter--qstate-current q))
+                      (= (utter--segment-index seg) (utter--item-position item))
+                      (not (utter--qstate-process q))
+                      (not (utter--qstate-paused q))
+                      (utter--select-stream-player format)))
+         (proc (and player
+                    (condition-case nil
+                        (utter--start-feed-player
+                         player seg (default-value 'utter-playback-rate) format nil)
+                      (error nil)))))
+    (if (not proc)
+        (setf (utter--feed-off feed) t)
+      (setf (utter--feed-process feed) proc)
+      (utter--player-started item seg proc 'streaming)
+      (utter--schedule))))
+
+(defun utter--start-feed-player (player seg rate format offset)
+  "Start PLAYER on the arriving audio of SEG in FORMAT at RATE.
+Skip OFFSET seconds of audio when it is non-nil.  Return the process."
+  (let ((proc (utter--start-player-process
+               (apply (utter-player-stdin-command player) rate format
+                      (and offset (list offset)))
+               player seg rate)))
+    (set-process-coding-system proc 'binary 'binary)
+    (process-put proc 'utter-feed (utter--segment-feed seg))
+    (process-put proc 'utter-format format)
+    proc))
+
+(defun utter--feed-send (feed bytes)
+  "Write BYTES to the player of FEED, if it still runs."
+  (let ((proc (utter--feed-process feed)))
+    (when (and (process-live-p proc) (> (length bytes) 0))
+      (ignore-errors (process-send-string proc bytes)))))
+
+(defun utter--feed-write (feed bytes)
+  "Pass BYTES of audio to the player of FEED.
+While paused the player is stopped and its pipe could fill, which
+would block Emacs, so BYTES wait for `utter--feed-flush'."
+  (push bytes (utter--feed-bytes feed))
+  (if (utter--qstate-paused utter--queue)
+      (push bytes (utter--feed-pending feed))
+    (utter--feed-send feed bytes)))
+
+(defun utter--feed-flush (feed)
+  "Write the audio FEED held back, and end its input once it ended.
+Nothing happens while paused."
+  (unless (utter--qstate-paused utter--queue)
+    (when-let* ((pending (utter--feed-pending feed)))
+      (setf (utter--feed-pending feed) nil)
+      (utter--feed-send feed (apply #'concat (nreverse pending))))
+    (when (and (utter--feed-ended feed) (not (utter--feed-eof-sent feed)))
+      (setf (utter--feed-eof-sent feed) t)
+      (let ((proc (utter--feed-process feed)))
+        (when (process-live-p proc)
+          (ignore-errors (process-send-eof proc)))))))
+
+(defun utter--feed-cues (item seg alignment)
+  "Append to the cues of SEG of ITEM those that ALIGNMENT covers.
+ALIGNMENT is a prefix of the segment text, as a stream reports it.
+A cue is added once the text up to its end is timed.  Cues do not
+depend on later timings, so those of a prefix are the first ones
+of the whole list.  The list grows in place, so a running progress
+timer sees the new cues.  Return non-nil if cues were added."
+  (condition-case nil
+      (let* ((text (utter--segment-text seg))
+             (chars (plist-get alignment :characters))
+             (n (length chars)))
+        (when (and (stringp chars) (<= n (length text))
+                   (string= chars (substring text 0 n)))
+          (let* ((pad (lambda (v) (vconcat v (make-vector (- (length text) (length v))
+                                                          1.0e9))))
+                 (all (utter--highlight-cues
+                       item seg (list :characters text
+                                      :starts (funcall pad (plist-get alignment :starts))
+                                      :ends (funcall pad (plist-get alignment :ends)))))
+                 (limit (+ (utter--segment-start seg) n))
+                 (new (cl-loop for cue in (nthcdr (length (utter--segment-cues seg)) all)
+                               while (<= (aref cue 2) limit) collect cue))
+                 (keep (cl-loop for cue in new append (append (substring cue 3 7) nil))))
+            ;; The other cues are thrown away; free their markers.
+            (dolist (cue all)
+              (unless (memq cue new)
+                (dotimes (i 4)
+                  (let ((m (aref cue (+ 3 i))))
+                    (unless (memq m keep) (set-marker m nil))))))
+            (when new
+              (if (utter--segment-cues seg)
+                  (nconc (utter--segment-cues seg) new)
+                (setf (utter--segment-cues seg) new))
+              t))))
+    (error nil)))
+
+(defun utter--feed-alignment (item seg alignment)
+  "Add the cues ALIGNMENT covers to SEG of ITEM and follow them."
+  (when (utter--feed-cues item seg alignment)
+    (let ((proc (utter--qstate-process utter--queue)))
+      (when (and proc (eq (process-get proc 'utter-segment) seg)
+                 (not (utter--qstate-paused utter--queue)))
+        (utter--progress-start proc)))))
+
+(defun utter--feed-drop (seg)
+  "Forget the stream of SEG and the cues built while it arrived."
+  (when (utter--segment-feed seg)
+    (setf (utter--segment-feed seg) nil)
+    (dolist (cue (utter--segment-cues seg))
+      (dotimes (i 4) (set-marker (aref cue (+ 3 i)) nil)))
+    (setf (utter--segment-cues seg) nil)))
+
+(defun utter--feed-teardown (seg)
+  "Stop the player of the stream of SEG, then forget the stream.
+The time it played is not counted: SEG starts over."
+  (when-let* ((feed (utter--segment-feed seg))
+              (proc (utter--feed-process feed)))
+    (let ((q utter--queue))
+      (utter--progress-stop proc)
+      (process-put proc 'utter-stopped t)
+      (when (eq proc (utter--qstate-process q))
+        (setf (utter--qstate-process q) nil
+              (utter--qstate-seg-start q) nil
+              (utter--qstate-pause-start q) nil
+              (utter--qstate-paused-total q) 0))
+      (ignore-errors
+        (funcall (or (utter-player-stop (process-get proc 'utter-player))
+                     #'delete-process)
+                 proc))))
+  (utter--feed-drop seg))
+
+(defun utter--feed-player-died (item seg)
+  "Fail SEG of ITEM, whose player exited while its audio arrived."
+  (let ((req (utter--segment-request seg)))
+    (utter--feed-drop seg)
+    (setf (utter--segment-status seg) 'error
+          (utter--segment-request seg) nil)
+    (when req (ignore-errors (utter-abort req)))
+    (utter--segment-failed item seg "player exited while the audio was arriving")))
+
+(defun utter--feed-resume (proc)
+  "Resume PROC, a paused player reading a stream; return the player.
+A player that resumes by restarting (ffplay skips the paused
+stretch on SIGCONT, also on a pipe) starts again at the paused
+offset: from the whole file once the stream has ended, else on a
+new pipe given all audio received so far.  Other players resume
+as usual and get the audio held back."
+  (let* ((feed (process-get proc 'utter-feed))
+         (player (process-get proc 'utter-player))
+         (seg (process-get proc 'utter-segment))
+         (file (utter--segment-file seg)))
+    (cond
+     ((not (eq (utter-player-resume player) #'utter-player-restart))
+      (funcall (utter-player-resume player) proc)
+      ;; Emacs refuses to write to a process it still thinks stopped.
+      (when (eq (process-status proc) 'stop) (continue-process proc))
+      (utter--feed-flush feed)
+      proc)
+     ((and (utter--feed-ended feed) file (file-exists-p file))
+      (utter-player-restart proc))
+     (t
+      (let ((new (utter--start-feed-player player seg (process-get proc 'utter-rate)
+                                           (process-get proc 'utter-format)
+                                           (process-get proc 'utter-offset))))
+        (process-put proc 'utter-stopped t)
+        (delete-process proc)
+        (setf (utter--feed-process feed) new
+              (utter--feed-pending feed) nil
+              (utter--feed-eof-sent feed) nil)
+        (utter--feed-send feed (apply #'concat (reverse (utter--feed-bytes feed))))
+        (utter--feed-flush feed)
+        new)))))
 
 ;;;; Resetting items
 
@@ -1278,8 +1595,10 @@ stay listed and can be replayed.  PARAMS are as for
     (when (utter--qstate-paused q)
       (setf (utter--qstate-paused q) nil)
       (when-let* ((proc (utter--qstate-process q)))
-        (let ((new (funcall (utter-player-resume (process-get proc 'utter-player))
-                            proc)))
+        (let ((new (if (process-get proc 'utter-feed)
+                       (utter--feed-resume proc)
+                     (funcall (utter-player-resume (process-get proc 'utter-player))
+                              proc))))
           (when (and (processp new) (not (eq new proc)))
             (utter--progress-stop proc)
             (process-put new 'utter-was-paused t)

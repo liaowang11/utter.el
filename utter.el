@@ -168,6 +168,16 @@ from `utter-player-afplay' (macOS), `utter-player-ffplay' and
   :type '(choice (const auto) symbol sexp)
   :group 'utter)
 
+(defcustom utter-streaming nil
+  "When non-nil, start playing audio while it is still being received.
+Only backends with the `streaming' capability and a player that reads
+from a pipe (ffplay or mpv; afplay cannot) are affected; with afplay
+alone utter says so once and plays whole audio as when this is nil.
+Streamed audio is still cached.  Highlighting follows timing data as
+it arrives."
+  :type 'boolean
+  :group 'utter)
+
 (defcustom utter-input-functions '(utter--gptel-response-at-point
                                    utter--org-subtree-at-point
                                    utter--page-at-point)
@@ -428,8 +438,13 @@ dry run goes to the *utter-inspect* buffer; secrets are redacted."
                                    utter--default-max-chars)
                                (or (utter-backend-max-chars-unit (plist-get params :backend))
                                    'chars)))
+         (format (plist-get params :format))
+         (stream (and (utter--stream-eligible-p (plist-get params :backend)
+                                                (plist-get params :model) format)
+                      (utter--select-stream-player format)
+                      '(:stream t)))
          (dry (apply #'utter-request (car pieces) :dry-run t
-                     (utter--params-args params))))
+                     (append stream (utter--params-args params)))))
     (with-current-buffer (get-buffer-create "*utter-inspect*")
       (let ((inhibit-read-only t))
         (erase-buffer)
