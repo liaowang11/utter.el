@@ -124,10 +124,17 @@ Unlike `utter-speed' it needs no new synthesis.  See
 
 (defcustom utter-highlight nil
   "When non-nil, highlight the text being spoken in its buffer.
-Highlight the current sentence when the backend supplies usable timing
-metadata (xAI and ElevenLabs), otherwise the playing request-sized piece.
-The highlight is removed as soon as the buffer text changes."
-  :type 'boolean
+With t, highlight the current sentence when the backend supplies usable
+timing metadata (xAI and ElevenLabs), otherwise the playing
+request-sized piece.  With `word', also highlight the current word
+inside the sentence, which is then shown in `utter-highlight-sentence';
+Chinese and Japanese text goes character by character.  A sentence
+whose words cannot be matched to the buffer is highlighted as with t.
+The value in effect when text is queued applies to all of it.  The
+highlight is removed as soon as the buffer text changes."
+  :type '(choice (const :tag "Off" nil)
+                 (const :tag "Sentence" t)
+                 (const :tag "Word" word))
   :group 'utter)
 
 (defcustom utter-highlight-follow nil
